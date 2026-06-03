@@ -3,7 +3,7 @@
  * Plugin Name:       Sync Elementor Cache
  * Plugin URI:        https://github.com/sansiromedia/sync-elementor-cache
  * Description:       Keeps Elementor in sync with WP Rocket and/or SiteGround Optimizer so logged-out visitors don't see stale CSS after editor saves, library template changes, or plugin updates. Auto-detects which caching layers are present and adapts.
- * Version:           4.1.0
+ * Version:           4.2.0
  * Requires at least: 6.0
  * Requires PHP:      7.4
  * Author:            Pip Baddock
@@ -23,7 +23,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 define( 'SEC_PLUGIN_FILE',    __FILE__ );
 define( 'SEC_PLUGIN_DIR',     plugin_dir_path( __FILE__ ) );
-define( 'SEC_PLUGIN_VERSION', '4.1.0' );
+define( 'SEC_PLUGIN_VERSION', '4.2.0' );
 define( 'SEC_PLUGIN_SLUG',    'sync-elementor-cache' );
 
 // ---------------------------------------------------------------------------
@@ -69,6 +69,74 @@ final class SEC_Detector {
             'sg_soft'     => self::has_sg_soft(),
             'sg_nuclear'  => self::has_sg_nuclear(),
         );
+    }
+
+    /**
+     * Scan for known footgun combinations and return zero-or-more
+     * "you might want to fix this" recommendations. Each is informational —
+     * the plugin never auto-changes a host setting.
+     *
+     * @return array<int, array{level:string, title:string, body:string, fix:string}>
+     */
+    public static function recommendations() {
+        $recs = array();
+
+        // Footgun 1: Elementor 4.x + internal CSS print method.
+        // Real-world: on SG sites this leaves per-post CSS sitting in
+        // _elementor_css postmeta with status:inline but never printed
+        // for most posts → broken layout after any cache flush. Less acute
+        // on cPanel but still worth eliminating to make sites resilient
+        // to future Elementor flushes.
+        if ( self::has_elementor() ) {
+            $print_method  = get_option( 'elementor_css_print_method' );
+            $el_version    = defined( '\Elementor\ELEMENTOR_VERSION' ) ? \Elementor\ELEMENTOR_VERSION : '';
+            $is_elementor4 = $el_version && version_compare( $el_version, '4.0.0', '>=' );
+
+            if ( $print_method === 'internal' && $is_elementor4 ) {
+                $recs[] = array(
+                    'level' => self::has_sg_soft() ? 'critical' : 'warning',
+                    'title' => sprintf(
+                        /* translators: %s = Elementor version */
+                        __( 'Elementor %s + "internal" CSS print method is a known issue', 'sync-elementor-cache' ),
+                        esc_html( $el_version )
+                    ),
+                    'body'  => __(
+                        'Elementor 4.x silently fails to inline per-post CSS for some posts when print method is "internal" — the CSS is generated and saved to <code>_elementor_css</code> postmeta with status <code>inline</code>, but Elementor never writes it into the page. Symptom: anonymous visitors see broken layouts on header / archive / template-using pages, especially right after a cache flush. The condition is much more aggressive on SiteGround. Recommended setting on all Elementor 4.x sites: <strong>external</strong> (Elementor writes per-post CSS files to <code>wp-content/uploads/elementor/css/</code> and includes them via <code>&lt;link&gt;</code> tags — reliable).',
+                        'sync-elementor-cache'
+                    ),
+                    'fix'   => __(
+                        'In WordPress admin: Elementor → Settings → Advanced → CSS Print Method → External File. After saving, Elementor → Tools → Regenerate Files & Data, then come back here and click "Purge everything".',
+                        'sync-elementor-cache'
+                    ),
+                );
+            }
+        }
+
+        // Footgun 2: WP Rocket "Remove Unused CSS" on Elementor sites.
+        // Strips dynamic-state CSS (mega-menu open, popup visible, etc.)
+        // because those selectors aren't on the page at RUCSS scan time.
+        if ( self::has_rocket() && self::has_elementor() ) {
+            $rocket_settings = get_option( 'wp_rocket_settings', array() );
+            $rucss           = ! empty( $rocket_settings['remove_unused_css'] ) ? 1 : 0;
+            $rucss_mobile    = ! empty( $rocket_settings['remove_unused_css_mobile'] ) ? 1 : 0;
+
+            if ( $rucss || $rucss_mobile ) {
+                $recs[] = array(
+                    'level' => 'critical',
+                    'title' => __( 'WP Rocket "Remove Unused CSS" is enabled — known to break Elementor dynamic widgets', 'sync-elementor-cache' ),
+                    'body'  => __(
+                        'RUCSS scans the rendered HTML to figure out which CSS selectors are "used" and strips the rest. Selectors that only become active on user interaction — mega-menu open states (<code>.e-n-menu-toggle[aria-expanded="true"]</code>), popup-visible classes, slider active slides, accordion expanded states — all look "unused" to RUCSS at scan time and get removed. Result: hamburger menus that look dead, popups that don\'t open, sliders stuck on the first slide. Logged-in admins bypass Rocket entirely so the symptom is incognito-only and easy to miss.',
+                        'sync-elementor-cache'
+                    ),
+                    'fix'   => __(
+                        'In WordPress admin: WP Rocket → File Optimization → CSS Files → uncheck "Remove Unused CSS" (both desktop and mobile if separately enabled). The performance loss is roughly 20-50 KB of unused CSS per page; the reliability gain is dynamic widgets that actually work.',
+                        'sync-elementor-cache'
+                    ),
+                );
+            }
+        }
+
+        return $recs;
     }
 }
 
@@ -268,9 +336,29 @@ function sec_render_admin_page() {
 
     $detected = SEC_Detector::summary();
     $last     = get_option( 'sec_last_purge', array() );
+    $recs     = SEC_Detector::recommendations();
 
     echo '<div class="wrap"><h1>Sync Elementor Cache</h1>';
     echo '<p>Version ' . esc_html( SEC_PLUGIN_VERSION ) . ' &mdash; auto-updates from <code>github.com/sansiromedia/sync-elementor-cache</code>.</p>';
+
+    // ---------- Recommendations (informational, never auto-applied) ----------
+    if ( ! empty( $recs ) ) {
+        echo '<h2>Recommendations</h2>';
+        foreach ( $recs as $r ) {
+            $color = $r['level'] === 'critical' ? '#d63638' : '#dba617';
+            printf(
+                '<div style="border-left:4px solid %s;background:#fff;padding:12px 16px;margin:0 0 12px 0;max-width:760px;">' .
+                '<p style="margin:0 0 8px 0;"><strong>%s</strong></p>' .
+                '<p style="margin:0 0 8px 0;">%s</p>' .
+                '<p style="margin:0;"><em>Fix:</em> %s</p>' .
+                '</div>',
+                esc_attr( $color ),
+                esc_html( $r['title'] ),
+                wp_kses_post( $r['body'] ),
+                wp_kses_post( $r['fix'] )
+            );
+        }
+    }
 
     echo '<h2>Detected cache layers</h2><table class="widefat striped" style="max-width:520px;"><tbody>';
     $rows = array(
@@ -315,6 +403,37 @@ function sec_render_admin_page() {
 }
 
 // ---------------------------------------------------------------------------
+// Admin notice — surface critical recommendations on every wp-admin page so
+// they're not missed if Maria doesn't visit Settings → Sync Elementor Cache.
+// Dismissible per-user via the 'sec_dismiss_notice' meta.
+// ---------------------------------------------------------------------------
+add_action( 'admin_notices', function () {
+    if ( ! current_user_can( 'manage_options' ) ) {
+        return;
+    }
+    $screen = function_exists( 'get_current_screen' ) ? get_current_screen() : null;
+    if ( $screen && $screen->id === 'settings_page_sync-elementor-cache' ) {
+        return; // already showing on the plugin's own page
+    }
+    $recs = array_filter( SEC_Detector::recommendations(), function ( $r ) {
+        return $r['level'] === 'critical';
+    } );
+    if ( empty( $recs ) ) {
+        return;
+    }
+    $dismissed = (int) get_user_meta( get_current_user_id(), 'sec_dismiss_notice_v' . SEC_PLUGIN_VERSION, true );
+    if ( $dismissed ) {
+        return;
+    }
+    $url = admin_url( 'options-general.php?page=sync-elementor-cache' );
+    printf(
+        '<div class="notice notice-error"><p><strong>Sync Elementor Cache:</strong> %d critical configuration issue(s) detected on this site. <a href="%s">Review &amp; fix &rarr;</a></p></div>',
+        count( $recs ),
+        esc_url( $url )
+    );
+} );
+
+// ---------------------------------------------------------------------------
 // WP-CLI command — `wp sync-elementor-cache purge` / `... status`
 // ---------------------------------------------------------------------------
 if ( defined( 'WP_CLI' ) && WP_CLI ) {
@@ -342,6 +461,41 @@ if ( defined( 'WP_CLI' ) && WP_CLI ) {
                     $last['post_id'] ? 'post ' . $last['post_id'] : 'site-wide',
                     gmdate( 'Y-m-d H:i:s', $last['time'] )
                 ) );
+            }
+            $recs = SEC_Detector::recommendations();
+            if ( ! empty( $recs ) ) {
+                WP_CLI::log( '' );
+                WP_CLI::log( 'Recommendations:' );
+                foreach ( $recs as $r ) {
+                    WP_CLI::log( sprintf( '  [%s] %s', strtoupper( $r['level'] ), $r['title'] ) );
+                }
+                WP_CLI::log( '' );
+                WP_CLI::log( 'Run `wp sync-elementor-cache recommendations` for details and fix instructions.' );
+            }
+        }
+
+        /**
+         * Show full recommendation details with fix instructions.
+         *
+         * ## EXAMPLES
+         *
+         *     wp sync-elementor-cache recommendations
+         */
+        public function recommendations() {
+            $recs = SEC_Detector::recommendations();
+            if ( empty( $recs ) ) {
+                WP_CLI::success( 'No recommendations — configuration looks healthy.' );
+                return;
+            }
+            foreach ( $recs as $i => $r ) {
+                if ( $i > 0 ) {
+                    WP_CLI::log( '' );
+                }
+                WP_CLI::log( sprintf( '[%s] %s', strtoupper( $r['level'] ), $r['title'] ) );
+                WP_CLI::log( '' );
+                WP_CLI::log( '  ' . wp_strip_all_tags( $r['body'] ) );
+                WP_CLI::log( '' );
+                WP_CLI::log( '  Fix: ' . wp_strip_all_tags( $r['fix'] ) );
             }
         }
 

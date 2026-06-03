@@ -51,15 +51,19 @@ Once installed, the plugin auto-updates from GitHub releases — no further acti
 
 ## Admin UI
 
+- **Recommendations** — flags known footgun configurations (e.g. Elementor 4.x + `internal` CSS print method, WP Rocket "Remove Unused CSS" on Elementor sites). The plugin never auto-changes a host setting — it shows the issue + the fix instructions, you decide.
 - **Detected cache layers** — at-a-glance view of what's active on the host
 - **Last purge** — scope, post (if applicable), timestamp
 - **Manual purge button** — same effect as `?sec_purge_all=1`
 
+A critical-level recommendation also surfaces as a dismissible admin notice across all wp-admin pages, so issues aren't missed if you don't visit the settings page.
+
 ## WP-CLI
 
 ```bash
-wp sync-elementor-cache status   # Show detected layers + last purge
-wp sync-elementor-cache purge    # Trigger site-wide purge
+wp sync-elementor-cache status            # Detected layers + last purge + recommendation summary
+wp sync-elementor-cache recommendations   # Full recommendation details + fix instructions
+wp sync-elementor-cache purge             # Trigger site-wide purge
 ```
 
 ## Requirements
@@ -79,4 +83,5 @@ GPL-2.0-or-later. See `LICENSE`.
 
 ## Update history
 
+- **v4.2.0** (2026-06-03) — Adds **Recommendations** surface (admin page + dismissible admin notice + `wp sync-elementor-cache recommendations` CLI). Detects: (1) Elementor 4.x + `internal` CSS print method (silently fails to inline per-post CSS — observed on acrodyne, nutrend); (2) WP Rocket "Remove Unused CSS" on Elementor sites (strips dynamic-state CSS, breaks mega-menus and popups in incognito — observed on acrodyne). The plugin still never auto-modifies host settings; recommendations are informational only.
 - **v4.1.0** (2026-06-03) — Initial plugin release. Distilled from the v4 WPCode snippet pattern across multiple client sites. Adds auto-detection, admin UI, WP-CLI.
