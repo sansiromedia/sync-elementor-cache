@@ -3,7 +3,7 @@
  * Plugin Name:       Sync Elementor Cache
  * Plugin URI:        https://github.com/sansiromedia/sync-elementor-cache
  * Description:       Keeps Elementor in sync with WP Rocket and/or SiteGround Optimizer so logged-out visitors don't see stale CSS after editor saves, library template changes, or plugin updates. Auto-detects which caching layers are present and adapts.
- * Version:           4.2.0
+ * Version:           4.3.0
  * Requires at least: 6.0
  * Requires PHP:      7.4
  * Author:            Pip Baddock
@@ -23,7 +23,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 define( 'SEC_PLUGIN_FILE',    __FILE__ );
 define( 'SEC_PLUGIN_DIR',     plugin_dir_path( __FILE__ ) );
-define( 'SEC_PLUGIN_VERSION', '4.2.0' );
+define( 'SEC_PLUGIN_VERSION', '4.3.0' );
 define( 'SEC_PLUGIN_SLUG',    'sync-elementor-cache' );
 
 // ---------------------------------------------------------------------------
@@ -239,10 +239,19 @@ final class SEC_Purger {
     }
 
     private static function stamp_last_purge( $scope, $post_id ) {
+        // Capture the WordPress hook that ended up triggering the purge, so
+        // post-hoc diagnosis doesn't need filesystem forensics. Falls back to
+        // 'manual' for admin-page / WP-CLI / ?sec_purge_all=1 invocations that
+        // aren't inside a hook fire.
+        $hook = current_filter();
+        if ( empty( $hook ) ) {
+            $hook = 'manual';
+        }
         update_option( 'sec_last_purge', array(
             'scope'   => $scope,
             'post_id' => $post_id,
             'time'    => time(),
+            'hook'    => $hook,
         ), false );
     }
 }
@@ -381,11 +390,12 @@ function sec_render_admin_page() {
         echo '<p>No purge recorded since plugin activation.</p>';
     } else {
         printf(
-            '<p>Scope: <code>%s</code>%s<br>When: <code>%s</code> (%s ago)</p>',
+            '<p>Scope: <code>%s</code>%s<br>When: <code>%s</code> (%s ago)<br>Triggered by: <code>%s</code></p>',
             esc_html( $last['scope'] ),
             empty( $last['post_id'] ) ? '' : ' (post ID ' . (int) $last['post_id'] . ')',
             esc_html( gmdate( 'Y-m-d H:i:s', $last['time'] ) . ' UTC' ),
-            esc_html( human_time_diff( $last['time'], time() ) )
+            esc_html( human_time_diff( $last['time'], time() ) ),
+            esc_html( isset( $last['hook'] ) ? $last['hook'] : 'unknown (pre-4.3 purge)' )
         );
     }
 
@@ -456,10 +466,11 @@ if ( defined( 'WP_CLI' ) && WP_CLI ) {
             $last = get_option( 'sec_last_purge', array() );
             if ( ! empty( $last ) ) {
                 WP_CLI::log( sprintf(
-                    'Last purge: %s (%s) at %s UTC',
+                    'Last purge: %s (%s) at %s UTC — trigger: %s',
                     $last['scope'],
                     $last['post_id'] ? 'post ' . $last['post_id'] : 'site-wide',
-                    gmdate( 'Y-m-d H:i:s', $last['time'] )
+                    gmdate( 'Y-m-d H:i:s', $last['time'] ),
+                    isset( $last['hook'] ) ? $last['hook'] : 'unknown (pre-4.3 purge)'
                 ) );
             }
             $recs = SEC_Detector::recommendations();
