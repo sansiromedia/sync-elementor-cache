@@ -3,7 +3,7 @@
  * Plugin Name:       Sync Elementor Cache
  * Plugin URI:        https://github.com/sansiromedia/sync-elementor-cache
  * Description:       Keeps Elementor in sync with WP Rocket and/or SiteGround Optimizer so logged-out visitors don't see stale CSS after editor saves, library template changes, or plugin updates. Auto-detects which caching layers are present and adapts.
- * Version:           4.3.0
+ * Version:           4.3.1
  * Requires at least: 6.0
  * Requires PHP:      7.4
  * Author:            Pip Baddock
@@ -23,7 +23,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 define( 'SEC_PLUGIN_FILE',    __FILE__ );
 define( 'SEC_PLUGIN_DIR',     plugin_dir_path( __FILE__ ) );
-define( 'SEC_PLUGIN_VERSION', '4.3.0' );
+define( 'SEC_PLUGIN_VERSION', '4.3.1' );
 define( 'SEC_PLUGIN_SLUG',    'sync-elementor-cache' );
 
 // ---------------------------------------------------------------------------
@@ -88,8 +88,15 @@ final class SEC_Detector {
         // on cPanel but still worth eliminating to make sites resilient
         // to future Elementor flushes.
         if ( self::has_elementor() ) {
-            $print_method  = get_option( 'elementor_css_print_method' );
-            $el_version    = defined( '\Elementor\ELEMENTOR_VERSION' ) ? \Elementor\ELEMENTOR_VERSION : '';
+            $print_method = get_option( 'elementor_css_print_method' );
+
+            // Elementor defines ELEMENTOR_VERSION in the GLOBAL namespace, not
+            // under \Elementor\. v4.2.0–v4.3.0 looked it up as
+            // \Elementor\ELEMENTOR_VERSION, which never resolves — $el_version
+            // was always '' so this whole check silently never fired on any
+            // site. Found 2026-08-03 on shirleyyeung.com.au, which was running
+            // Elementor 4.2.1 + 'internal' and still reported "healthy".
+            $el_version    = defined( 'ELEMENTOR_VERSION' ) ? ELEMENTOR_VERSION : '';
             $is_elementor4 = $el_version && version_compare( $el_version, '4.0.0', '>=' );
 
             if ( $print_method === 'internal' && $is_elementor4 ) {
@@ -437,10 +444,35 @@ add_action( 'admin_notices', function () {
     }
     $url = admin_url( 'options-general.php?page=sync-elementor-cache' );
     printf(
-        '<div class="notice notice-error"><p><strong>Sync Elementor Cache:</strong> %d critical configuration issue(s) detected on this site. <a href="%s">Review &amp; fix &rarr;</a></p></div>',
+        '<div class="notice notice-error is-dismissible" data-sec-notice="1"><p><strong>Sync Elementor Cache:</strong> %d critical configuration issue(s) detected on this site. <a href="%s">Review &amp; fix &rarr;</a></p></div>',
         count( $recs ),
         esc_url( $url )
     );
+
+    // The dismissal has to be persisted server-side — core's dismiss button
+    // only hides the node for the current page view. Without this the notice
+    // reappeared on every admin page forever: v4.2.0–v4.3.0 read the
+    // 'sec_dismiss_notice_v*' user meta but nothing ever wrote it, and the
+    // div wasn't even marked is-dismissible.
+    $nonce = wp_create_nonce( 'sec_dismiss_notice' );
+    printf(
+        '<script>jQuery(function($){$(document).on("click","[data-sec-notice] .notice-dismiss",function(){' .
+        '$.post(ajaxurl,{action:"sec_dismiss_notice",_ajax_nonce:"%s"});});});</script>',
+        esc_js( $nonce )
+    );
+} );
+
+/**
+ * Persist the per-user, per-version dismissal written by the notice above.
+ * Keyed on SEC_PLUGIN_VERSION so a new release re-surfaces outstanding issues.
+ */
+add_action( 'wp_ajax_sec_dismiss_notice', function () {
+    check_ajax_referer( 'sec_dismiss_notice' );
+    if ( ! current_user_can( 'manage_options' ) ) {
+        wp_send_json_error( null, 403 );
+    }
+    update_user_meta( get_current_user_id(), 'sec_dismiss_notice_v' . SEC_PLUGIN_VERSION, 1 );
+    wp_send_json_success();
 } );
 
 // ---------------------------------------------------------------------------
