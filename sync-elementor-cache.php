@@ -3,7 +3,7 @@
  * Plugin Name:       Sync Elementor Cache
  * Plugin URI:        https://github.com/sansiromedia/sync-elementor-cache
  * Description:       Keeps Elementor in sync with WP Rocket and/or SiteGround Optimizer so logged-out visitors don't see stale CSS after editor saves, library template changes, or plugin updates. Auto-detects which caching layers are present and adapts.
- * Version:           4.3.1
+ * Version:           4.4.0
  * Requires at least: 6.0
  * Requires PHP:      7.4
  * Author:            Pip Baddock
@@ -23,7 +23,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 define( 'SEC_PLUGIN_FILE',    __FILE__ );
 define( 'SEC_PLUGIN_DIR',     plugin_dir_path( __FILE__ ) );
-define( 'SEC_PLUGIN_VERSION', '4.3.1' );
+define( 'SEC_PLUGIN_VERSION', '4.4.0' );
 define( 'SEC_PLUGIN_SLUG',    'sync-elementor-cache' );
 
 // ---------------------------------------------------------------------------
@@ -209,6 +209,27 @@ final class SEC_Purger {
             \Elementor\Plugin::$instance->files_manager->clear_cache();
         }
 
+        // 1b. Close the regeneration window (v4.4.0).
+        //     clear_cache() above deletes EVERY Elementor CSS file on a live site and
+        //     leaves regeneration to the next render of each page. For ordinary posts
+        //     that is fine — the first visitor pays and the file is written correctly.
+        //
+        //     It is NOT fine for the global set: the active kit, and the theme-builder
+        //     templates that are actually in use. Those appear on every page, so between
+        //     the delete and the first render their CSS URLs 404 and pages render
+        //     unstyled. Logged-out visitors are shielded by the page cache (rebuilt only
+        //     after regeneration completes), but logged-in users get a live render with
+        //     no shield — so whoever runs a plugin update and then clicks around is
+        //     precisely who sees the broken layout.
+        //
+        //     Measured on businessassist.net 2026-08-30: a ~14s window (22:52:53 ->
+        //     22:53:07 UTC) after a four-plugin update batch.
+        //
+        //     Regenerating the global set synchronously here removes that window. The
+        //     set is small — kit + in-use headers/footers, 3 templates on that site
+        //     against 836 Elementor-built posts — so this stays cheap.
+        self::regenerate_global_css();
+
         // 2. Standard site-wide cache layer wipe.
         self::purge_all( null );
 
@@ -221,6 +242,85 @@ final class SEC_Purger {
 
         self::stamp_last_purge( 'site', null );
         self::$purging = false;
+    }
+
+    /**
+     * Rebuild the Elementor CSS that every page depends on, synchronously.
+     *
+     * Deliberately NOT every Elementor post — that would be hundreds of files and
+     * would make purge_site() unusable inside a request. Only the set whose absence
+     * breaks layout site-wide:
+     *
+     *   - the active kit (global colours + typography)
+     *   - published elementor_library templates that have display conditions set
+     *
+     * Templates with no _elementor_conditions are skipped on purpose: they never
+     * render, so Elementor never generates CSS for them and their "missing" file is
+     * correct behaviour, not a fault. Do not treat those as something to fix.
+     *
+     * @return int Number of CSS files written.
+     */
+    public static function regenerate_global_css() {
+
+        if ( ! class_exists( '\Elementor\Core\Files\CSS\Post' ) ) {
+            return 0;
+        }
+
+        $ids = array();
+
+        // Active kit — global colours and typography, referenced by every page.
+        $kit = (int) get_option( 'elementor_active_kit' );
+        if ( $kit ) {
+            $ids[] = $kit;
+        }
+
+        // In-use theme-builder templates (headers, footers, archives, singles).
+        $templates = get_posts( array(
+            'post_type'              => 'elementor_library',
+            'post_status'            => 'publish',
+            'posts_per_page'         => 100,
+            'fields'                 => 'ids',
+            'no_found_rows'          => true,
+            'update_post_term_cache' => false,
+            'meta_query'             => array(
+                array(
+                    'key'     => '_elementor_conditions',
+                    'compare' => 'EXISTS',
+                ),
+            ),
+        ) );
+
+        foreach ( $templates as $tid ) {
+            // EXISTS still matches an empty array serialised into the meta, which is
+            // what Elementor leaves behind when every condition is removed. Those
+            // templates do not render, so skip them.
+            $conditions = get_post_meta( $tid, '_elementor_conditions', true );
+            if ( empty( $conditions ) ) {
+                continue;
+            }
+            $ids[] = (int) $tid;
+        }
+
+        $written = 0;
+        foreach ( array_unique( array_filter( $ids ) ) as $id ) {
+            try {
+                $css = \Elementor\Core\Files\CSS\Post::create( $id );
+                $css->update();
+                $written++;
+            } catch ( \Throwable $e ) {
+                // A single bad template must not abort the purge — the caches below
+                // still need clearing. Regeneration for it falls back to lazy.
+                continue;
+            }
+        }
+
+        update_option( 'sec_last_global_regen', array(
+            'count' => $written,
+            'ids'   => array_values( array_unique( array_filter( $ids ) ) ),
+            'time'  => time(),
+        ), false );
+
+        return $written;
     }
 
     /**
@@ -552,6 +652,33 @@ if ( defined( 'WP_CLI' ) && WP_CLI ) {
         public function purge() {
             SEC_Purger::purge_site();
             WP_CLI::success( 'All caches purged.' );
+        }
+
+        /**
+         * Rebuild the Elementor CSS every page depends on: the active kit plus
+         * in-use theme-builder templates. Does NOT touch per-post CSS.
+         *
+         * Useful after a manual Elementor "Regenerate CSS", or to confirm the
+         * global set is intact without running a full purge.
+         *
+         * ## EXAMPLES
+         *
+         *     wp sync-elementor-cache regen
+         */
+        public function regen() {
+            $written = SEC_Purger::regenerate_global_css();
+            if ( ! $written ) {
+                WP_CLI::warning( 'Nothing regenerated — is Elementor active?' );
+                return;
+            }
+            $last = get_option( 'sec_last_global_regen', array() );
+            WP_CLI::log( 'Rebuilt: ' . implode( ', ', array_map(
+                function ( $id ) {
+                    return $id . ' (' . get_the_title( $id ) . ')';
+                },
+                isset( $last['ids'] ) ? $last['ids'] : array()
+            ) ) );
+            WP_CLI::success( sprintf( '%d global CSS file(s) regenerated.', $written ) );
         }
     }
 
