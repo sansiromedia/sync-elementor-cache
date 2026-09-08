@@ -3,7 +3,7 @@
  * Plugin Name:       Sync Elementor Cache
  * Plugin URI:        https://github.com/sansiromedia/sync-elementor-cache
  * Description:       Keeps Elementor in sync with WP Rocket and/or SiteGround Optimizer so logged-out visitors don't see stale CSS after editor saves, library template changes, or plugin updates. Auto-detects which caching layers are present and adapts.
- * Version:           4.4.0
+ * Version:           4.5.1
  * Requires at least: 6.0
  * Requires PHP:      7.4
  * Author:            Pip Baddock
@@ -23,7 +23,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 define( 'SEC_PLUGIN_FILE',    __FILE__ );
 define( 'SEC_PLUGIN_DIR',     plugin_dir_path( __FILE__ ) );
-define( 'SEC_PLUGIN_VERSION', '4.4.0' );
+define( 'SEC_PLUGIN_VERSION', '4.5.1' );
 define( 'SEC_PLUGIN_SLUG',    'sync-elementor-cache' );
 
 // ---------------------------------------------------------------------------
@@ -153,6 +153,10 @@ final class SEC_Detector {
 // ---------------------------------------------------------------------------
 final class SEC_Purger {
 
+    /** Upper bound on documents regenerated synchronously inside a purge. */
+    const MAX_GLOBAL_REGEN = 250;
+
+
     private static $purging = false;
 
     /**
@@ -260,6 +264,76 @@ final class SEC_Purger {
      *
      * @return int Number of CSS files written.
      */
+    /**
+     * Collect Elementor document ids nested inside a set of documents.
+     *
+     * A theme-builder header pulls its mega-menu panels in as separate Elementor documents,
+     * and archive templates pull in JetEngine listing templates the same way. Those nested
+     * documents have NO _elementor_conditions of their own, so the conditioned-template query
+     * in regenerate_global_css() never sees them - yet each one has its own post-<id>.css that
+     * the rendered page links to.
+     *
+     * After a purge those files are gone until something renders them. If WP Rocket minifies a
+     * page during that window, the combined bundle is built WITHOUT them and then cached, so the
+     * nested component (typically the mega menu) stays broken until the next full cache clear.
+     *
+     * Measured on spiritoftasmania staging 2026-09-01: 51 conditioned templates nested a further
+     * 35 documents, 25 of which had no CSS after a purge - including every mega-menu panel.
+     *
+     * @param int[] $ids   Documents to scan.
+     * @param int   $depth Remaining recursion depth (panels can nest panels).
+     * @return int[] Nested document ids.
+     */
+    protected static function collect_nested_ids( array $ids, $depth = 2 ) {
+
+        if ( $depth < 1 || empty( $ids ) ) {
+            return array();
+        }
+
+        $found = array();
+
+        // Elementor stores some settings url-encoded, so each blob is scanned in both forms.
+        $patterns = array(
+            '/"template_id"\s*:\s*"?(\d+)"?/',      // Template widget - mega-menu panels
+            '/"templateID"\s*:\s*"?(\d+)"?/',       // global widgets
+            '/"lis[it]{2}ng_id"\s*:\s*"?(\d+)"?/',  // JetEngine listing grid (their spelling)
+            '/elementor-template\s+id="?(\d+)"?/',   // [elementor-template] shortcode
+        );
+
+        foreach ( $ids as $id ) {
+
+            $data = get_post_meta( (int) $id, '_elementor_data', true );
+            if ( ! is_string( $data ) || '' === $data ) {
+                continue;
+            }
+
+            $haystack = $data;
+            if ( false !== strpos( $data, '%' ) ) {
+                $haystack .= "\n" . urldecode( $data );
+            }
+
+            foreach ( $patterns as $pattern ) {
+                if ( preg_match_all( $pattern, $haystack, $m ) ) {
+                    foreach ( $m[1] as $hit ) {
+                        $found[] = (int) $hit;
+                    }
+                }
+            }
+        }
+
+        $found = array_values( array_diff( array_unique( array_filter( $found ) ), $ids ) );
+
+        if ( empty( $found ) ) {
+            return array();
+        }
+
+        // Recurse - a mega panel can itself embed a listing template.
+        return array_values( array_unique( array_merge(
+            $found,
+            self::collect_nested_ids( array_merge( $ids, $found ), $depth - 1 )
+        ) ) );
+    }
+
     public static function regenerate_global_css() {
 
         if ( ! class_exists( '\Elementor\Core\Files\CSS\Post' ) ) {
@@ -290,6 +364,18 @@ final class SEC_Purger {
             ),
         ) );
 
+        // Only the templates that render on EVERY page belong in the synchronous set.
+        //
+        // A missing archive or single-post CSS file affects one page type, and the first
+        // render there regenerates it before that page's cache is written - lazy is fine.
+        // A missing header/footer file affects the whole site, and on a minifying host it
+        // gets baked into the combined bundle for every page at once.
+        //
+        // Measured on spiritoftasmania staging 2026-09-01: all 51 conditioned templates plus
+        // their nested set is 94 documents / 14.5s on every save. Narrowing to header+footer
+        // and their nested set is 21 documents / 7.3s and still covers every mega-menu panel.
+        $global_types = apply_filters( 'sec_global_template_types', array( 'header', 'footer' ) );
+
         foreach ( $templates as $tid ) {
             // EXISTS still matches an empty array serialised into the meta, which is
             // what Elementor leaves behind when every condition is removed. Those
@@ -298,11 +384,32 @@ final class SEC_Purger {
             if ( empty( $conditions ) ) {
                 continue;
             }
+
+            $type = (string) get_post_meta( $tid, '_elementor_template_type', true );
+            if ( ! in_array( $type, $global_types, true ) ) {
+                continue;
+            }
+
             $ids[] = (int) $tid;
         }
 
+        // Templates nested inside the set above - mega-menu panels, listing templates, global
+        // widgets. Each has its own post-<id>.css but no display conditions of its own, so
+        // without this they are missing until something renders them. See collect_nested_ids().
+        $ids = array_merge( $ids, self::collect_nested_ids( $ids ) );
+
+        // Only real Elementor documents - Post::create() on anything else writes an empty file.
+        $ids = array_filter( array_unique( array_filter( $ids ) ), function ( $id ) {
+            return '' !== (string) get_post_meta( (int) $id, '_elementor_data', true );
+        } );
+
+        // Hard cap. Pathological sites must not turn every save into a minutes-long request.
+        if ( count( $ids ) > self::MAX_GLOBAL_REGEN ) {
+            $ids = array_slice( $ids, 0, self::MAX_GLOBAL_REGEN );
+        }
+
         $written = 0;
-        foreach ( array_unique( array_filter( $ids ) ) as $id ) {
+        foreach ( $ids as $id ) {
             try {
                 $css = \Elementor\Core\Files\CSS\Post::create( $id );
                 $css->update();
