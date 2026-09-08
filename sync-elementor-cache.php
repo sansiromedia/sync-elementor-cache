@@ -3,7 +3,7 @@
  * Plugin Name:       Sync Elementor Cache
  * Plugin URI:        https://github.com/sansiromedia/sync-elementor-cache
  * Description:       Keeps Elementor in sync with WP Rocket and/or SiteGround Optimizer so logged-out visitors don't see stale CSS after editor saves, library template changes, or plugin updates. Auto-detects which caching layers are present and adapts.
- * Version:           4.5.1
+ * Version:           4.5.2
  * Requires at least: 6.0
  * Requires PHP:      7.4
  * Author:            Pip Baddock
@@ -23,7 +23,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 define( 'SEC_PLUGIN_FILE',    __FILE__ );
 define( 'SEC_PLUGIN_DIR',     plugin_dir_path( __FILE__ ) );
-define( 'SEC_PLUGIN_VERSION', '4.5.1' );
+define( 'SEC_PLUGIN_VERSION', '4.5.2' );
 define( 'SEC_PLUGIN_SLUG',    'sync-elementor-cache' );
 
 // ---------------------------------------------------------------------------
@@ -154,7 +154,17 @@ final class SEC_Detector {
 final class SEC_Purger {
 
     /** Upper bound on documents regenerated synchronously inside a purge. */
-    const MAX_GLOBAL_REGEN = 250;
+    const MAX_GLOBAL_REGEN = 60;
+
+    /**
+     * Wall-clock budget for synchronous regeneration, in seconds.
+     *
+     * A large mega-panel can take ~350ms to render its CSS, so a count-based cap alone is not a
+     * safety net - 250 documents would be ~90s and blow max_execution_time, turning a save into a
+     * 500. Whatever is not reached inside the budget falls back to Elementor's own lazy
+     * regeneration, which is exactly the pre-4.4.0 behaviour: correct, just not pre-warmed.
+     */
+    const REGEN_TIME_BUDGET = 10;
 
 
     private static $purging = false;
@@ -409,7 +419,19 @@ final class SEC_Purger {
         }
 
         $written = 0;
+        $skipped = 0;
+        $started = microtime( true );
+
         foreach ( $ids as $id ) {
+
+            // Budget exceeded - leave the remainder to lazy regeneration rather than risk a
+            // timeout. Ordering matters: $ids is kit-first, then header/footer, then nested,
+            // so the most site-wide files are always the ones that get done.
+            if ( ( microtime( true ) - $started ) > self::REGEN_TIME_BUDGET ) {
+                $skipped = count( $ids ) - $written;
+                break;
+            }
+
             try {
                 $css = \Elementor\Core\Files\CSS\Post::create( $id );
                 $css->update();
@@ -422,6 +444,8 @@ final class SEC_Purger {
         }
 
         update_option( 'sec_last_global_regen', array(
+            'skipped' => $skipped,
+            'seconds' => round( microtime( true ) - $started, 1 ),
             'count' => $written,
             'ids'   => array_values( array_unique( array_filter( $ids ) ) ),
             'time'  => time(),
