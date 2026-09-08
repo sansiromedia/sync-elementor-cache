@@ -3,7 +3,7 @@
  * Plugin Name:       Sync Elementor Cache
  * Plugin URI:        https://github.com/sansiromedia/sync-elementor-cache
  * Description:       Keeps Elementor in sync with WP Rocket and/or SiteGround Optimizer so logged-out visitors don't see stale CSS after editor saves, library template changes, or plugin updates. Auto-detects which caching layers are present and adapts.
- * Version:           4.5.2
+ * Version:           4.6.0
  * Requires at least: 6.0
  * Requires PHP:      7.4
  * Author:            Pip Baddock
@@ -23,7 +23,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 define( 'SEC_PLUGIN_FILE',    __FILE__ );
 define( 'SEC_PLUGIN_DIR',     plugin_dir_path( __FILE__ ) );
-define( 'SEC_PLUGIN_VERSION', '4.5.2' );
+define( 'SEC_PLUGIN_VERSION', '4.6.0' );
 define( 'SEC_PLUGIN_SLUG',    'sync-elementor-cache' );
 
 // ---------------------------------------------------------------------------
@@ -461,16 +461,54 @@ final class SEC_Purger {
      */
     public static function is_site_wide_post( $post_id ) {
         $type = get_post_type( $post_id );
-        return in_array( $type, array( 'elementor_library', 'jet-engine' ), true );
+        return in_array( $type, array( 'elementor_library', 'jet-engine', 'jet-popup' ), true );
     }
 
+    /**
+     * Regenerate the CSS file for ONE document. Nothing else is touched.
+     *
+     * Elementor normally rewrites a document's CSS as part of saving it, but not always - a
+     * kit whose custom fonts changed was seen with CSS ten hours older than the kit itself
+     * (spiritoftasmania staging, 2026-09-01). Refreshing the saved document explicitly costs
+     * one file (~350ms for a large mega panel) and makes the save path deterministic.
+     */
+    public static function refresh_document_css( $post_id ) {
+        $post_id = (int) $post_id;
+        if ( ! $post_id || ! class_exists( '\\Elementor\\Core\\Files\\CSS\\Post' ) ) {
+            return false;
+        }
+        if ( '' === (string) get_post_meta( $post_id, '_elementor_data', true ) ) {
+            return false;
+        }
+        try {
+            \Elementor\Core\Files\CSS\Post::create( $post_id )->update();
+            return true;
+        } catch ( \Throwable $e ) {
+            return false;
+        }
+    }
+
+    /**
+     * Save-time purge, routed by what was saved.
+     *
+     * v4.6.0: site-wide documents (templates, listings, popups, the kit) no longer take the
+     * nuclear purge_site() path. That path deletes EVERY Elementor CSS file and then races
+     * visitors to regenerate them - the window it opens is what let a mega menu render
+     * unstyled and get baked into a cached, minified bundle. A save only invalidates the saved
+     * document's own CSS, so: refresh that one file, then purge page caches site-wide.
+     * Zero window, and saves are faster than under 4.4.0-4.5.x.
+     *
+     * purge_site() remains for the events that genuinely change CSS everywhere: plugin/theme
+     * updates, kit switch, Elementor's own "Regenerate", and the manual purge.
+     */
     public static function purge_for_elementor_post( $post_id ) {
         $post_id = (int) $post_id;
         if ( ! $post_id ) {
             return;
         }
         if ( self::is_site_wide_post( $post_id ) ) {
-            self::purge_site();
+            self::refresh_document_css( $post_id );
+            self::purge_all( null );          // domain-wide: a template appears on arbitrary pages
         } else {
             self::purge_all( $post_id );
         }
@@ -527,7 +565,20 @@ add_action( 'save_post_elementor_library', function ( $post_id ) {
     if ( wp_is_post_revision( $post_id ) || wp_is_post_autosave( $post_id ) ) {
         return;
     }
-    SEC_Purger::purge_site();
+    SEC_Purger::purge_for_elementor_post( (int) $post_id );
+}, 5 );
+
+// Custom font added/changed. Fonts have no CSS of their own - their @font-face lives in the
+// KIT's CSS, which Elementor was seen NOT regenerating on its own. Refresh the kit explicitly.
+add_action( 'save_post_elementor_font', function ( $post_id ) {
+    if ( wp_is_post_revision( $post_id ) || wp_is_post_autosave( $post_id ) ) {
+        return;
+    }
+    $kit = (int) get_option( 'elementor_active_kit' );
+    if ( $kit ) {
+        SEC_Purger::refresh_document_css( $kit );
+    }
+    SEC_Purger::purge_all( null );
 }, 5 );
 
 // Elementor Kit (global colors/typography) and bulk regen.
@@ -535,14 +586,14 @@ add_action( 'update_option_elementor_active_kit',    array( 'SEC_Purger', 'purge
 add_action( 'elementor/core/files/after_regenerate', array( 'SEC_Purger', 'purge_site' ), 5 );
 
 // WordPress "Additional CSS" edits.
-add_action( 'save_post_custom_css', array( 'SEC_Purger', 'purge_site' ), 5 );
+add_action( 'save_post_custom_css', function () { SEC_Purger::purge_all( null ); }, 5 );
 
 // WPCode snippet saves (changes runtime PHP/JS output cached in HTML).
 add_action( 'save_post_wpcode', function ( $post_id ) {
     if ( wp_is_post_revision( $post_id ) || wp_is_post_autosave( $post_id ) ) {
         return;
     }
-    SEC_Purger::purge_site();
+    SEC_Purger::purge_all( null );
 }, 5 );
 
 // Manual admin purge: ?sec_purge_all=1 on any front-end URL while logged in
