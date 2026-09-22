@@ -3,7 +3,7 @@
  * Plugin Name:       Sync Elementor Cache
  * Plugin URI:        https://github.com/sansiromedia/sync-elementor-cache
  * Description:       Keeps Elementor in sync with WP Rocket and/or SiteGround Optimizer so logged-out visitors don't see stale CSS after editor saves, library template changes, or plugin updates. Auto-detects which caching layers are present and adapts.
- * Version:           4.6.0
+ * Version:           4.7.0
  * Requires at least: 6.0
  * Requires PHP:      7.4
  * Author:            Pip Baddock
@@ -169,41 +169,195 @@ final class SEC_Purger {
 
     private static $purging = false;
 
+    /** Purge scopes. */
+    const SCOPE_POST = 'post';
+    const SCOPE_SITE = 'site';
+
+    /** Cron hook for the coalesced trailing purge. */
+    const HOOK_DEFERRED = 'sec_run_deferred_purge';
+
     /**
-     * Per-post (low-churn) purge. Used for editor saves on a single page.
-     * On SG, uses the soft purge (URL-targeted). Does NOT clear cached
-     * error responses — that's what purge_site() handles.
+     * Public entry point. Signature-compatible with <= 4.6.x: an id means "one page
+     * changed", null means "something global changed".
+     *
+     * v4.7.0 no longer purges unconditionally - a request may run now or be folded
+     * into a single trailing purge. See request_purge().
      */
     public static function purge_all( $post_id = null ) {
+        $post_id = $post_id ? (int) $post_id : null;
+        self::request_purge( $post_id ? self::SCOPE_POST : self::SCOPE_SITE, $post_id );
+    }
 
-        // WP Rocket page cache: per-post if we have an ID, site-wide otherwise.
-        if ( $post_id && function_exists( 'rocket_clean_post' ) ) {
-            rocket_clean_post( $post_id );
-        } elseif ( function_exists( 'rocket_clean_domain' ) ) {
-            rocket_clean_domain();
+    /**
+     * Decide whether to purge now, later, or not at all. Three gates, cheapest first:
+     *
+     *   1. sec_should_purge - the host site can veto. No-op by default.
+     *   2. non-interactive context (WP-CLI, cron) - always coalesce. Nobody is watching
+     *      a screen, and these are exactly where bulk writers live.
+     *   3. rate window - the FIRST save purges immediately, because an editor expects to
+     *      see their change. Saves inside the window fold into one trailing purge.
+     *      Leading-edge debounce: 20 saves in a minute cost 2 purges, not 20.
+     */
+    public static function request_purge( $scope, $post_id = null ) {
+
+        if ( ! apply_filters( 'sec_should_purge', true, $scope, $post_id ) ) {
+            return;
         }
 
-        // Rocket minified CSS, cache-busting bundles, used-CSS (guarded —
-        // older Rocket versions may not have all of these).
-        if ( function_exists( 'rocket_clean_minify' ) ) {
-            rocket_clean_minify( 'css' );
-        }
-        if ( function_exists( 'rocket_clean_cache_busting' ) ) {
-            rocket_clean_cache_busting();
-        }
-        if ( function_exists( 'rocket_clean_used_css' ) ) {
-            rocket_clean_used_css();
+        // Inside purge_site(): the caller already decided this is nuclear.
+        if ( self::$purging ) {
+            self::execute( $post_id, $scope, true );
+            return;
         }
 
-        // SG Optimizer SOFT purge — URL-keyed memcache invalidation. Cheap,
-        // safe to call on every save. Doesn't reach cached error responses.
-        if ( function_exists( 'sg_cachepress_purge_cache' ) ) {
-            sg_cachepress_purge_cache();
+        if ( ! self::is_interactive() || self::is_throttled( $scope ) ) {
+            self::defer( $scope, $post_id );
+            return;
         }
 
-        wp_cache_flush();
+        self::execute( $post_id, $scope, false );
+    }
 
-        self::stamp_last_purge( 'all', $post_id );
+    /** WP-CLI and cron are bulk contexts by nature - never purge synchronously there. */
+    private static function is_interactive() {
+        if ( defined( 'WP_CLI' ) && WP_CLI ) {
+            return false;
+        }
+        if ( function_exists( 'wp_doing_cron' ) && wp_doing_cron() ) {
+            return false;
+        }
+        return true;
+    }
+
+    /** Debounce window, seconds. Filter to 0 to restore <= 4.6.x immediate behaviour. */
+    private static function window() {
+        return max( 0, (int) apply_filters( 'sec_purge_window', 60 ) );
+    }
+
+    private static function is_throttled( $scope ) {
+        $window = self::window();
+        if ( $window <= 0 ) {
+            return false;
+        }
+        $key  = 'sec_purge_last_' . $scope;
+        $last = (int) get_option( $key, 0 );
+        $now  = time();
+        if ( $last && ( $now - $last ) < $window ) {
+            return true;
+        }
+        update_option( $key, $now, false );
+        return false;
+    }
+
+    /**
+     * Fold this request into the pending set and book a trailing purge.
+     *
+     * Post ids dedupe by array key, so a writer touching one post 500 times costs one
+     * entry. Past 200 distinct posts a single domain purge is cheaper than 200 targeted
+     * ones, so the set collapses to site scope.
+     */
+    public static function defer( $scope, $post_id = null ) {
+
+        $pending = get_option( 'sec_pending_purge' );
+        if ( ! is_array( $pending ) ) {
+            $pending = array( 'site' => false, 'posts' => array() );
+        }
+
+        if ( self::SCOPE_SITE === $scope ) {
+            $pending['site']  = true;
+            $pending['posts'] = array();
+        } elseif ( $post_id ) {
+            $pending['posts'][ (int) $post_id ] = 1;
+            if ( count( $pending['posts'] ) > 200 ) {
+                $pending['site']  = true;
+                $pending['posts'] = array();
+            }
+        }
+
+        update_option( 'sec_pending_purge', $pending, false );
+
+        if ( ! wp_next_scheduled( self::HOOK_DEFERRED ) ) {
+            wp_schedule_single_event( time() + max( 30, self::window() ), self::HOOK_DEFERRED );
+        }
+    }
+
+    /** Run the coalesced purge booked by defer(). */
+    public static function run_deferred() {
+
+        $pending = get_option( 'sec_pending_purge' );
+        delete_option( 'sec_pending_purge' );
+
+        if ( ! is_array( $pending ) ) {
+            return;
+        }
+
+        if ( ! empty( $pending['site'] ) ) {
+            self::execute( null, self::SCOPE_SITE, false );
+            return;
+        }
+
+        foreach ( array_keys( (array) $pending['posts'] ) as $pid ) {
+            self::execute( (int) $pid, self::SCOPE_POST, false );
+        }
+    }
+
+    /**
+     * Do the actual cache clearing.
+     *
+     * SCOPE_POST touches ONLY the changed page. v4.6.x called the three site-wide Rocket
+     * CSS cleaners (minify / cache-busting / used-CSS) plus wp_cache_flush() on EVERY
+     * save, so one editor saving one page wiped the entire object cache and every
+     * minified bundle. On a site with a persistent object cache (memcached/Redis) that
+     * flush is self-inflicted load - every option, term and meta lookup goes back to
+     * MySQL at once, in a thundering herd.
+     *
+     * Shared bundles only need clearing when shared CSS actually changed: SCOPE_SITE.
+     * A full object-cache flush is reserved for purge_site().
+     *
+     * @param int|null $post_id            Post, for SCOPE_POST.
+     * @param string   $scope              SCOPE_POST | SCOPE_SITE.
+     * @param bool     $flush_object_cache Nuclear path only.
+     */
+    public static function execute( $post_id, $scope, $flush_object_cache = false ) {
+
+        if ( self::SCOPE_POST === $scope && $post_id ) {
+
+            if ( function_exists( 'rocket_clean_post' ) ) {
+                rocket_clean_post( $post_id );
+            }
+
+            // Targeted object-cache invalidation. Also makes Rocket's own
+            // clean_post_cache subscribers drop this post's used-CSS.
+            clean_post_cache( $post_id );
+
+            if ( function_exists( 'sg_cachepress_purge_cache' ) ) {
+                $url = get_permalink( $post_id );
+                sg_cachepress_purge_cache( $url ? $url : false );
+            }
+        } else {
+
+            if ( function_exists( 'rocket_clean_domain' ) ) {
+                rocket_clean_domain();
+            }
+            if ( function_exists( 'rocket_clean_minify' ) ) {
+                rocket_clean_minify( 'css' );
+            }
+            if ( function_exists( 'rocket_clean_cache_busting' ) ) {
+                rocket_clean_cache_busting();
+            }
+            if ( function_exists( 'rocket_clean_used_css' ) ) {
+                rocket_clean_used_css();
+            }
+            if ( function_exists( 'sg_cachepress_purge_cache' ) ) {
+                sg_cachepress_purge_cache();
+            }
+        }
+
+        if ( $flush_object_cache ) {
+            wp_cache_flush();
+        }
+
+        self::stamp_last_purge( $scope, $post_id );
     }
 
     /**
@@ -244,8 +398,9 @@ final class SEC_Purger {
         //     against 836 Elementor-built posts — so this stays cheap.
         self::regenerate_global_css();
 
-        // 2. Standard site-wide cache layer wipe.
-        self::purge_all( null );
+        // 2. Standard site-wide cache layer wipe, plus the full object-cache flush.
+        //    Explicit execute() - this path must never be throttled or deferred.
+        self::execute( null, self::SCOPE_SITE, true );
 
         // 3. SG NUCLEAR purge — clears cached error responses (403, 5xx) too.
         //    Documented as v4 in the central skill: a WAF rate-limit can leave
@@ -536,6 +691,9 @@ final class SEC_Purger {
 // Hooks — bind purgers to every event that should cause a cache invalidation.
 // Same hook set as v4 of the central skill.
 // ---------------------------------------------------------------------------
+
+// Coalesced trailing purge booked by SEC_Purger::defer().
+add_action( SEC_Purger::HOOK_DEFERRED, array( 'SEC_Purger', 'run_deferred' ) );
 
 // Elementor's explicit "clear CSS" action.
 add_action( 'elementor/core/files/clear_cache', array( 'SEC_Purger', 'purge_site' ), 5 );
