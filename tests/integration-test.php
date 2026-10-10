@@ -57,6 +57,13 @@ function sec_reset( $extra_ids = array() ) {
     }
     wp_clear_scheduled_hook( SEC_Purger::HOOK_DEFERRED );
     $ref = new ReflectionClass( 'SEC_Purger' );
+    foreach ( array( 'request_flush_ran' => false, 'origin_hook' => '' ) as $prop => $val ) {
+        if ( $ref->hasProperty( $prop ) ) {
+            $p = $ref->getProperty( $prop );
+            $p->setAccessible( true );
+            $p->setValue( null, $val );
+        }
+    }
     if ( $ref->hasProperty( 'request_items' ) ) {
         $p = $ref->getProperty( 'request_items' );
         $p->setAccessible( true );
@@ -286,6 +293,9 @@ sec_t( 'autosave (document + editor hooks) does not purge, collect, book or thro
     count( $urls ) . ' SG purge(s), collected=' . json_encode( $collected ) . ' throttle=' . var_export( (bool) $thr_after, true ) . ' pending=' . json_encode( sec_pending() ) );
 
 // 12. purge_site() clears work it covered, but keeps work booked while it ran.
+if ( ! $sg_on ) {
+    sec_skip( 'purge_site keeps work booked mid-purge', 'needs SG dynamic cache (the mid-purge booking hooks its flush)' );
+} else {
 sec_reset();
 SEC_Purger::defer( SEC_Purger::SCOPE_POST, 900001 );
 SEC_Purger::defer( SEC_Purger::SCOPE_SITE );
@@ -296,6 +306,7 @@ SEC_Purger::purge_site();
 remove_action( 'siteground_optimizer_flush_cache', $book_mid );
 remove_action( 'clean_post_cache', $book_mid );
 sec_t( 'purge_site clears covered work, keeps work booked mid-purge', array( 900002 ) === sec_pending(), 'pending=' . json_encode( sec_pending() ) );
+}
 
 // 13. Only one deferred runner at a time; an abandoned lock expires.
 if ( ! defined( 'SEC_Purger::LOCK_NAME' ) ) {
@@ -334,6 +345,63 @@ SEC_Purger::defer( SEC_Purger::SCOPE_POST, 900001 );
 if ( ! wp_next_scheduled( SEC_Purger::HOOK_DEFERRED ) ) { wp_schedule_single_event( time() + 60, SEC_Purger::HOOK_DEFERRED ); }
 do_action( 'deactivate_' . plugin_basename( SEC_PLUGIN_FILE ), false );
 sec_t( 'deactivation removes pending rows + scheduled event', array() === sec_pending() && ! wp_next_scheduled( SEC_Purger::HOOK_DEFERRED ), 'pending=' . json_encode( sec_pending() ) );
+
+
+// 16. Rocket: the shutdown purge of a page really purges, even though Rocket already ran its
+//     once-per-request rocket_clean_post() for that page earlier in the save.
+if ( ! function_exists( 'rocket_clean_post' ) ) {
+    sec_skip( 'shutdown purge beats Rocket per-request guard', 'WP Rocket not active' );
+} else {
+    sec_reset( array( $some_post ) );
+    rocket_clean_post( $some_post ); // what wp_update_post -> clean_post_cache does mid-save
+    $interactive_on();
+    SEC_Purger::purge_all( $some_post );
+    $files = array();
+    $cb    = function ( $urls ) use ( &$files ) { $files = array_merge( $files, (array) $urls ); };
+    add_action( 'before_rocket_clean_files', $cb );
+    if ( method_exists( 'SEC_Purger', 'run_request_purges' ) ) { SEC_Purger::run_request_purges(); }
+    remove_action( 'before_rocket_clean_files', $cb );
+    $interactive_off();
+    $permalink = get_permalink( $some_post );
+    sec_t( 'shutdown purge clears the page in Rocket despite its once-per-request guard', in_array( $permalink, $files, true ), 'rocket files purged: ' . count( $files ) );
+}
+
+// 17. A held lock never leaves pending work without a scheduled event.
+sec_reset();
+if ( ! defined( 'SEC_Purger::LOCK_NAME' ) ) {
+    sec_t( 'busy lock reschedules', false, 'no LOCK_NAME' );
+} else {
+    $wpdb->insert( $wpdb->options, array( 'option_name' => 'sec_pending_900001', 'option_value' => time() . ':x', 'autoload' => 'no' ) );
+    $wpdb->insert( $wpdb->options, array( 'option_name' => SEC_Purger::LOCK_NAME, 'option_value' => (string) time(), 'autoload' => 'no' ) );
+    wp_clear_scheduled_hook( SEC_Purger::HOOK_DEFERRED );
+    SEC_Purger::run_deferred();
+    $scheduled = (bool) wp_next_scheduled( SEC_Purger::HOOK_DEFERRED );
+    sec_t( 'busy lock: pending work gets a scheduled event', $scheduled && array( 900001 ) === sec_pending(), 'scheduled=' . var_export( $scheduled, true ) );
+}
+
+// 18. A purge asked for after the shutdown flush ran (another plugin writing at shutdown) still runs.
+sec_reset( array( $some_post ) );
+$interactive_on();
+if ( method_exists( 'SEC_Purger', 'run_request_purges' ) ) { SEC_Purger::run_request_purges(); }
+$n = sec_count_post_purges( function () use ( $some_post ) { SEC_Purger::purge_all( $some_post ); } );
+$interactive_off();
+sec_t( 'purge requested after the shutdown flush still runs', 1 === ( $n[ $some_post ] ?? 0 ), ( $n[ $some_post ] ?? 0 ) . ' purge(s)' );
+
+// 19. "Triggered by" records the hook that asked for the purge, not 'shutdown'.
+sec_reset( array( $some_post ) );
+$interactive_on();
+$ask = function () use ( $some_post ) { SEC_Purger::purge_all( $some_post ); };
+add_action( 'sec_test_origin', $ask );
+do_action( 'sec_test_origin' );
+remove_action( 'sec_test_origin', $ask );
+$run = function () { if ( method_exists( 'SEC_Purger', 'run_request_purges' ) ) { SEC_Purger::run_request_purges(); } };
+add_action( 'sec_test_shutdown', $run );
+do_action( 'sec_test_shutdown' );
+remove_action( 'sec_test_shutdown', $run );
+$interactive_off();
+wp_cache_delete( 'sec_last_purge', 'options' );
+$l = get_option( 'sec_last_purge' );
+sec_t( 'last purge records the originating hook', 'sec_test_origin' === ( $l['hook'] ?? '' ), 'hook=' . ( $l['hook'] ?? '?' ) );
 
 sec_reset( array( $some_post, $template ) );
 echo "\n" . $GLOBALS['sec_results']['pass'] . ' passed, ' . $GLOBALS['sec_results']['fail'] . ' failed, ' . $GLOBALS['sec_results']['skip'] . " skipped\n";

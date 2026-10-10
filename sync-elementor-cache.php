@@ -204,8 +204,12 @@ final class SEC_Purger {
      */
     private static $request_items = array();
 
-    /** Whether the request-end purge is registered. */
+    /** Whether the request-end purge is registered / has already run this request. */
     private static $request_flush_registered = false;
+    private static $request_flush_ran        = false;
+
+    /** Hook that originally asked for a purge collected for shutdown (for "Triggered by"). */
+    private static $origin_hook = '';
 
     /** Lock row (deliberately NOT under PENDING_PREFIX). */
     const LOCK_NAME = 'sec_deferred_lock';
@@ -264,7 +268,14 @@ final class SEC_Purger {
             return;
         }
 
-        self::$request_items[ $item ] = true;
+        // Asked for after our shutdown flush already ran (another plugin writing at
+        // shutdown): there is no later point in this request, so purge now.
+        if ( self::$request_flush_ran ) {
+            self::execute( $post_id, $scope, false );
+            return;
+        }
+
+        self::$request_items[ $item ] = current_filter();
         if ( ! self::$request_flush_registered ) {
             self::$request_flush_registered = true;
             add_action( 'shutdown', array( __CLASS__, 'run_request_purges' ), 0 );
@@ -273,16 +284,22 @@ final class SEC_Purger {
 
     /** Shutdown: run what this request collected, once, after all of its writes. */
     public static function run_request_purges() {
+        self::$request_flush_ran = true;
         $items = self::$request_items;
         self::$request_items = array();
         if ( ! $items ) {
             return;
         }
-        if ( isset( $items['site'] ) || count( $items ) > self::DEFER_COLLAPSE_AT ) {
-            self::execute( null, self::SCOPE_SITE, false );
-            return;
+        self::$origin_hook = (string) reset( $items );
+        try {
+            if ( isset( $items['site'] ) || count( $items ) > self::DEFER_COLLAPSE_AT ) {
+                self::execute( null, self::SCOPE_SITE, false );
+            } else {
+                self::execute_posts( array_keys( $items ) );
+            }
+        } finally {
+            self::$origin_hook = '';
         }
-        self::execute_posts( array_keys( $items ) );
     }
 
     /** WP-CLI and cron are bulk contexts by nature - never purge per write there. */
@@ -390,6 +407,11 @@ final class SEC_Purger {
             (string) time()
         ) );
         if ( 1 !== (int) $got ) {
+            // Another runner holds the lock. If WP-Cron already consumed our event, make
+            // sure something will come back for rows that runner did not read.
+            if ( ! wp_next_scheduled( self::HOOK_DEFERRED ) ) {
+                wp_schedule_single_event( time() + max( 30, self::window() ), self::HOOK_DEFERRED );
+            }
             return;
         }
 
@@ -522,6 +544,36 @@ final class SEC_Purger {
         self::stamp_last_purge( $scope, null );
     }
 
+    /**
+     * Rocket's per-post purge, without rocket_clean_post()'s once-per-request guard.
+     *
+     * Rocket hooks rocket_clean_post() to clean_post_cache, so during an Elementor save it has
+     * already run (inside wp_update_post, BEFORE Elementor deletes the old CSS) and its static
+     * $done makes any later call in the same request a no-op. Our shutdown purge must really
+     * purge, so call the same building blocks directly. Falls back to rocket_clean_post().
+     */
+    private static function rocket_purge_post( $pid ) {
+        if ( ! function_exists( 'rocket_get_purge_urls' ) || ! function_exists( 'rocket_clean_files' ) ) {
+            if ( function_exists( 'rocket_clean_post' ) ) {
+                rocket_clean_post( $pid );
+            }
+            return;
+        }
+        $post = get_post( $pid );
+        if ( ! $post || in_array( $post->post_status, array( 'auto-draft', 'draft' ), true ) ) {
+            return;
+        }
+        $type = get_post_type_object( $post->post_type );
+        if ( ! $type || true !== $type->public ) {
+            return;
+        }
+        $urls = apply_filters( 'rocket_post_purge_urls', rocket_get_purge_urls( $pid, $post ), $post );
+        rocket_clean_files( $urls );
+        if ( function_exists( 'rocket_clean_home' ) ) {
+            rocket_clean_home();
+        }
+    }
+
     /** SCOPE_POST for one or more posts: per-post work in a loop, one SG soft purge total. */
     public static function execute_posts( array $post_ids ) {
         $post_ids = array_values( array_unique( array_filter( array_map( 'intval', $post_ids ) ) ) );
@@ -530,9 +582,7 @@ final class SEC_Purger {
         }
 
         foreach ( $post_ids as $pid ) {
-            if ( function_exists( 'rocket_clean_post' ) ) {
-                rocket_clean_post( $pid );
-            }
+            self::rocket_purge_post( $pid );
             // Targeted object-cache invalidation. Also makes Rocket's own
             // clean_post_cache subscribers drop this post's used-CSS.
             clean_post_cache( $pid );
@@ -869,7 +919,7 @@ final class SEC_Purger {
         // post-hoc diagnosis doesn't need filesystem forensics. Falls back to
         // 'manual' for admin-page / WP-CLI / ?sec_purge_all=1 invocations that
         // aren't inside a hook fire.
-        $hook = current_filter();
+        $hook = self::$origin_hook ? self::$origin_hook : current_filter();
         if ( empty( $hook ) ) {
             $hook = 'manual';
         }
