@@ -187,6 +187,9 @@ final class SEC_Purger {
      */
     const PENDING_PREFIX = 'sec_pending_';
 
+    /** Delay of the safety-net event booked by WP-CLI / cron purges, seconds. */
+    const SAFETY_NET_DELAY = 600;
+
     /** Past this many distinct deferred posts, one site-wide purge is cheaper. */
     const DEFER_COLLAPSE_AT = 20;
 
@@ -261,9 +264,10 @@ final class SEC_Purger {
         }
 
         if ( ! self::is_interactive() ) {
-            // Flushed at process end; no WP-Cron event, so a visitor-spawned cron run cannot
-            // start purging half-way through a long bulk job.
-            self::defer( $scope, $post_id, false );
+            // Flushed at process end. Only a far-out safety-net event is booked: a visitor-spawned
+            // cron run cannot start purging half-way through a normal bulk job, but a process
+            // killed before shutdown (Ctrl-C, OOM, FPM timeout) still gets its work purged.
+            self::defer( $scope, $post_id, self::SAFETY_NET_DELAY );
             self::flush_on_shutdown();
             return;
         }
@@ -364,7 +368,12 @@ final class SEC_Purger {
      * a run that read the old value will not delete it (see delete_pending()). Single atomic
      * statements on a unique key, so concurrent requests cannot lose each other's bookings.
      */
-    public static function defer( $scope, $post_id = null, $schedule = true ) {
+    /**
+     * @param string   $scope
+     * @param int|null $post_id
+     * @param int      $delay   Seconds until the trailing event; 0 = the normal window.
+     */
+    public static function defer( $scope, $post_id = null, $delay = 0 ) {
         global $wpdb;
 
         $name  = self::PENDING_PREFIX . ( self::SCOPE_POST === $scope && $post_id ? (int) $post_id : 'site' );
@@ -378,8 +387,16 @@ final class SEC_Purger {
             $token
         ) );
 
-        if ( $schedule && ! wp_next_scheduled( self::HOOK_DEFERRED ) ) {
-            wp_schedule_single_event( time() + max( 30, self::window() ), self::HOOK_DEFERRED );
+        // One event at a time, at the EARLIEST time anyone asked for: a browser save's trailing
+        // purge must not wait behind a CLI job's 10-minute safety net.
+        $want = time() + ( $delay > 0 ? (int) $delay : max( 30, self::window() ) );
+        $next = wp_next_scheduled( self::HOOK_DEFERRED );
+        if ( $next && $next > $want ) {
+            wp_unschedule_event( $next, self::HOOK_DEFERRED );
+            $next = false;
+        }
+        if ( ! $next ) {
+            wp_schedule_single_event( $want, self::HOOK_DEFERRED );
         }
     }
 
@@ -580,6 +597,8 @@ final class SEC_Purger {
         if ( function_exists( 'rocket_is_importing' ) && rocket_is_importing() ) {
             return;
         }
+        // As Rocket: a WordPress heartbeat/post autosave request never purges. (Elementor's
+        // autosaves don't define DOING_AUTOSAVE; they are handled in purge_for_elementor_post().)
         if ( defined( 'DOING_AUTOSAVE' ) ) {
             return;
         }
@@ -629,9 +648,17 @@ final class SEC_Purger {
 
         foreach ( $post_ids as $pid ) {
             self::rocket_purge_post( $pid );
-            // Targeted object-cache invalidation. Also makes Rocket's own
-            // clean_post_cache subscribers drop this post's used-CSS.
+            // Targeted object-cache invalidation. Rocket hooks rocket_clean_post() to
+            // clean_post_cache; detach it for this call so the Rocket purge (and its Cloudflare /
+            // host-cache / preload listeners) runs once, not twice, outside a save request.
+            $rocket_hooked = has_action( 'clean_post_cache', 'rocket_clean_post' );
+            if ( false !== $rocket_hooked ) {
+                remove_action( 'clean_post_cache', 'rocket_clean_post', $rocket_hooked );
+            }
             clean_post_cache( $pid );
+            if ( false !== $rocket_hooked ) {
+                add_action( 'clean_post_cache', 'rocket_clean_post', $rocket_hooked );
+            }
         }
 
         if ( function_exists( 'sg_cachepress_purge_cache' ) ) {
@@ -952,10 +979,13 @@ final class SEC_Purger {
         if ( ! $post_id ) {
             return;
         }
-        // Elementor autosaves of a DRAFT are written into the draft itself, so is_autosave() and
-        // wp_is_post_autosave() are false; only the request says it is an autosave. Visitors
-        // cannot see an autosave either way, so do not purge (every 60s while editing).
-        if ( self::is_elementor_autosave_request() ) {
+        // Elementor autosaves of an UNPUBLISHED document are written into the document itself,
+        // so is_autosave() and wp_is_post_autosave() are false; only the request says it is an
+        // autosave. Skip only when THIS document is not visible to visitors - Elementor's own rule
+        // for where an autosave lands (documents-manager.php). A published document saved in the
+        // same batch (e.g. an Elementor Pro global widget template) is a real save and purges.
+        if ( self::is_elementor_autosave_request()
+            && ! in_array( get_post_status( $post_id ), array( 'publish', 'private' ), true ) ) {
             return;
         }
         if ( self::is_site_wide_post( $post_id ) ) {

@@ -444,32 +444,67 @@ if ( count( $templates ) < 2 ) {
         'req1=' . json_encode( array_keys( $c1 ) ) . ' req2=' . json_encode( array_keys( $c2 ) ) . ' pending=' . json_encode( sec_pending() ) );
 }
 
-// 21. An Elementor autosave request of a DRAFT (written into the draft itself) does not purge;
-//     a real save request does.
-sec_reset( array( $some_post ) );
+// 21. Elementor autosave request: an UNPUBLISHED document autosaved into itself does not purge;
+//     a PUBLISHED document saved in the same batch (Pro global widget) does; a real save of the
+//     draft does.
+$draft = wp_insert_post( array( 'post_type' => 'page', 'post_status' => 'draft', 'post_title' => 'sec draft autosave test' ) );
+sec_reset( array( $some_post, $draft, $template ) );
 $interactive_on();
 add_filter( 'wp_doing_ajax', '__return_true' );
 $saved_request = $_REQUEST;
 $items_prop    = $sec_ref->getProperty( 'request_items' ); $items_prop->setAccessible( true );
-$_REQUEST['action']  = 'elementor_ajax';
-$_REQUEST['actions'] = wp_slash( wp_json_encode( array( 'save_builder_' . $some_post => array( 'action' => 'save_builder', 'data' => array( 'status' => 'autosave' ) ) ) ) );
-SEC_Purger::purge_for_elementor_post( $some_post );
-$auto = $items_prop->getValue();
-sec_reset( array( $some_post ) );
-$_REQUEST['actions'] = wp_slash( wp_json_encode( array( 'save_builder_' . $some_post => array( 'action' => 'save_builder', 'data' => array( 'status' => 'publish' ) ) ) ) );
-SEC_Purger::purge_for_elementor_post( $some_post );
+$autosave_req  = function ( $status ) use ( $draft ) {
+    $_REQUEST['action']  = 'elementor_ajax';
+    $_REQUEST['actions'] = wp_slash( wp_json_encode( array( 'save_builder_' . $draft => array( 'action' => 'save_builder', 'data' => array( 'status' => $status ) ) ) ) );
+};
+$autosave_req( 'autosave' );
+SEC_Purger::purge_for_elementor_post( $draft );
+$auto_draft = $items_prop->getValue();
+if ( $template ) {
+    SEC_Purger::purge_for_elementor_post( $template ); // published template in the same autosave batch
+}
+$with_pub = $items_prop->getValue();
+sec_reset( array( $some_post, $draft, $template ) );
+$autosave_req( 'draft' );
+SEC_Purger::purge_for_elementor_post( $draft );
 $real = $items_prop->getValue();
 $_REQUEST = $saved_request;
 remove_filter( 'wp_doing_ajax', '__return_true' );
 $interactive_off();
-sec_t( 'draft autosave request does not purge; a real save does', array() === $auto && isset( $real[ $some_post ] ) && array() === sec_pending(),
-    'autosave collected=' . json_encode( array_keys( $auto ) ) . ' real collected=' . json_encode( array_keys( $real ) ) );
+wp_delete_post( $draft, true );
+sec_t( 'autosave of an unpublished document does not purge', $draft && array() === $auto_draft, 'collected=' . json_encode( array_keys( $auto_draft ) ) );
+if ( $template ) {
+    sec_t( 'published template saved in an autosave batch still purges', isset( $with_pub['site'] ), 'collected=' . json_encode( array_keys( $with_pub ) ) );
+} else {
+    sec_skip( 'published template in autosave batch', 'no published template' );
+}
+sec_t( 'a real (non-autosave) save of the draft purges', isset( $real[ $draft ] ), 'collected=' . json_encode( array_keys( $real ) ) );
 
 // 22. WP-CLI / cron purges book no WP-Cron event (they flush at process end).
 sec_reset( array( $some_post ) );
 SEC_Purger::purge_all( $some_post );
-$scheduled = (bool) wp_next_scheduled( SEC_Purger::HOOK_DEFERRED );
-sec_t( 'CLI purge books no WP-Cron event', ! $scheduled && array( $some_post ) === sec_pending(), 'scheduled=' . var_export( $scheduled, true ) );
+$next = wp_next_scheduled( SEC_Purger::HOOK_DEFERRED );
+sec_t( 'CLI purge books only a far-out safety-net event (none mid-job)', $next && $next >= time() + 300 && array( $some_post ) === sec_pending(), 'next in ' . ( $next ? $next - time() : 'none' ) . 's' );
+
+// 23. A browser save's trailing purge is not held behind that safety net.
+SEC_Purger::defer( SEC_Purger::SCOPE_POST, 900001 ); // interactive-style booking (normal window)
+$next2 = wp_next_scheduled( SEC_Purger::HOOK_DEFERRED );
+sec_t( 'normal booking pulls the event forward from the safety net', $next2 && $next2 <= time() + 120, 'next in ' . ( $next2 ? $next2 - time() : 'none' ) . 's' );
+
+// 24. Outside a save request, a post purge runs Rocket's per-post purge exactly once.
+if ( ! function_exists( 'rocket_clean_post' ) ) {
+    sec_skip( 'Rocket per-post purge runs once', 'WP Rocket not active' );
+} else {
+    // Rocket's once-per-request guard cannot be reset, so use a post not yet purged in this process.
+    $other = (int) $wpdb->get_var( "SELECT ID FROM {$wpdb->posts} WHERE post_type='page' AND post_status='publish' AND ID > {$some_post}{$not_home} ORDER BY ID DESC LIMIT 1" );
+    sec_reset( array( $other ) );
+    $fires = 0;
+    $cb3   = function ( $post ) use ( &$fires, $other ) { if ( (int) $post->ID === $other ) { $fires++; } };
+    add_action( 'after_rocket_clean_post', $cb3 );
+    if ( $other ) { SEC_Purger::execute_posts( array( $other ) ); }
+    remove_action( 'after_rocket_clean_post', $cb3 );
+    sec_t( 'Rocket per-post purge (and its CDN/host listeners) runs once, not twice', ! $other || 1 === $fires, "post $other: $fires time(s)" );
+}
 
 sec_reset( array( $some_post, $template ) );
 echo "\n" . $GLOBALS['sec_results']['pass'] . ' passed, ' . $GLOBALS['sec_results']['fail'] . ' failed, ' . $GLOBALS['sec_results']['skip'] . " skipped\n";
