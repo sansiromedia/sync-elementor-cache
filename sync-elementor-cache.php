@@ -194,11 +194,24 @@ final class SEC_Purger {
     private static $shutdown_registered = false;
 
     /**
-     * Items already purged in this request. One Elementor template save fires three hooks
-     * (save_post_elementor_library, editor/after_save, document/after_save); the first purges
-     * and the other two are no-ops instead of each booking another trailing purge.
+     * Purges collected during this (browser) request, run once at shutdown.
+     *
+     * One Elementor template save fires three hooks, and the first (save_post_elementor_library,
+     * inside wp_update_post) fires BEFORE Elementor deletes the old CSS and element cache. Purging
+     * there leaves a gap in which a visitor render can re-cache the old markup. Running at
+     * shutdown - after the last write of the request - closes it, collapses the three hooks into
+     * one purge, and covers a request that saves several templates.
      */
-    private static $done_this_request = array();
+    private static $request_items = array();
+
+    /** Whether the request-end purge is registered. */
+    private static $request_flush_registered = false;
+
+    /** Lock row (deliberately NOT under PENDING_PREFIX). */
+    const LOCK_NAME = 'sec_deferred_lock';
+
+    /** A lock older than this is treated as abandoned (fatal mid-purge). */
+    const LOCK_TTL = 300;
 
     /**
      * Public entry point. Signature-compatible with <= 4.6.x: an id means "one page
@@ -219,9 +232,10 @@ final class SEC_Purger {
      *   2. inside purge_site() - nothing to do, its own site-wide execute() covers it.
      *   3. non-interactive context (WP-CLI, cron) - collect, then purge once when the
      *      process ends. Nobody is watching a screen, and bulk writers live here.
-     *   4. rate window - the first save of each page (or of site-wide CSS) purges
-     *      immediately, because an editor expects to see their change. Repeat saves of the
-     *      SAME item inside the window fold into one trailing purge.
+     *   4. rate window - the first save of each page (or of site-wide CSS) purges at the end
+     *      of the same request (run_request_purges, after the last write), because an editor
+     *      expects to see their change. Repeat saves of the SAME item inside the window fold
+     *      into one trailing purge.
      */
     public static function request_purge( $scope, $post_id = null ) {
 
@@ -239,9 +253,9 @@ final class SEC_Purger {
             return;
         }
 
-        // Exact repeat of an item already purged in this request (one save, several hooks).
+        // Already collected in this request (one save, several hooks): nothing more to do.
         $item = self::SCOPE_POST === $scope && $post_id ? (int) $post_id : 'site';
-        if ( isset( self::$done_this_request[ $item ] ) ) {
+        if ( isset( self::$request_items[ $item ] ) ) {
             return;
         }
 
@@ -250,8 +264,25 @@ final class SEC_Purger {
             return;
         }
 
-        self::$done_this_request[ $item ] = true;
-        self::execute( $post_id, $scope, false );
+        self::$request_items[ $item ] = true;
+        if ( ! self::$request_flush_registered ) {
+            self::$request_flush_registered = true;
+            add_action( 'shutdown', array( __CLASS__, 'run_request_purges' ), 0 );
+        }
+    }
+
+    /** Shutdown: run what this request collected, once, after all of its writes. */
+    public static function run_request_purges() {
+        $items = self::$request_items;
+        self::$request_items = array();
+        if ( ! $items ) {
+            return;
+        }
+        if ( isset( $items['site'] ) || count( $items ) > self::DEFER_COLLAPSE_AT ) {
+            self::execute( null, self::SCOPE_SITE, false );
+            return;
+        }
+        self::execute_posts( array_keys( $items ) );
     }
 
     /** WP-CLI and cron are bulk contexts by nature - never purge per write there. */
@@ -296,18 +327,23 @@ final class SEC_Purger {
     /**
      * Fold this request into the pending set and book a trailing purge.
      *
-     * INSERT IGNORE on a unique option_name is atomic, so a post booked 500 times is one
-     * row and two requests booking different posts cannot lose either.
+     * Row value is "{first booked time}:{token}". A new item inserts; re-booking an existing
+     * item keeps the first time (the overdue check needs the oldest) but changes the token, so
+     * a run that read the old value will not delete it (see delete_pending()). Single atomic
+     * statements on a unique key, so concurrent requests cannot lose each other's bookings.
      */
     public static function defer( $scope, $post_id = null ) {
         global $wpdb;
 
-        $name = self::PENDING_PREFIX . ( self::SCOPE_POST === $scope && $post_id ? (int) $post_id : 'site' );
+        $name  = self::PENDING_PREFIX . ( self::SCOPE_POST === $scope && $post_id ? (int) $post_id : 'site' );
+        $token = str_replace( '.', '', uniqid( '', true ) );
 
         $wpdb->query( $wpdb->prepare(
-            "INSERT IGNORE INTO {$wpdb->options} (option_name, option_value, autoload) VALUES (%s, %s, 'no')",
+            "INSERT INTO {$wpdb->options} (option_name, option_value, autoload) VALUES (%s, %s, 'no')
+             ON DUPLICATE KEY UPDATE option_value = CONCAT( SUBSTRING_INDEX( option_value, ':', 1 ), ':', %s )",
             $name,
-            (string) time()
+            time() . ':' . $token,
+            $token
         ) );
 
         if ( ! wp_next_scheduled( self::HOOK_DEFERRED ) ) {
@@ -315,7 +351,7 @@ final class SEC_Purger {
         }
     }
 
-    /** Pending rows straight from the DB: name => booked-at timestamp. */
+    /** Pending rows straight from the DB: name => raw value ("{time}:{token}"). */
     private static function pending_rows() {
         global $wpdb;
         $like = $wpdb->esc_like( self::PENDING_PREFIX ) . '%';
@@ -325,7 +361,7 @@ final class SEC_Purger {
         ) );
         $out = array();
         foreach ( (array) $rows as $row ) {
-            $out[ $row->option_name ] = (int) $row->option_value;
+            $out[ $row->option_name ] = (string) $row->option_value;
         }
         return $out;
     }
@@ -337,6 +373,34 @@ final class SEC_Purger {
     public static function run_deferred() {
         global $wpdb;
 
+        if ( ! self::pending_rows() ) {
+            return;
+        }
+
+        // One runner at a time: the overdue fallback and cron can otherwise start several full
+        // domain purges in parallel. INSERT IGNORE is atomic; an abandoned lock expires.
+        $wpdb->query( $wpdb->prepare(
+            "DELETE FROM {$wpdb->options} WHERE option_name = %s AND CAST(option_value AS UNSIGNED) < %d",
+            self::LOCK_NAME,
+            time() - self::LOCK_TTL
+        ) );
+        $got = $wpdb->query( $wpdb->prepare(
+            "INSERT IGNORE INTO {$wpdb->options} (option_name, option_value, autoload) VALUES (%s, %s, 'no')",
+            self::LOCK_NAME,
+            (string) time()
+        ) );
+        if ( 1 !== (int) $got ) {
+            return;
+        }
+
+        try {
+            self::run_deferred_locked();
+        } finally {
+            $wpdb->query( $wpdb->prepare( "DELETE FROM {$wpdb->options} WHERE option_name = %s", self::LOCK_NAME ) );
+        }
+    }
+
+    private static function run_deferred_locked() {
         $rows = self::pending_rows();
         if ( ! $rows ) {
             return;
@@ -360,27 +424,24 @@ final class SEC_Purger {
 
         // Delete only after the purge ran, so a fatal mid-purge leaves the work pending
         // (at-least-once: a repeated purge is harmless, a lost one is not).
-        self::delete_pending( $names );
+        self::delete_pending( $rows );
     }
 
-    /** Delete pending rows by name, or all of them when $names is null. */
-    private static function delete_pending( $names = null ) {
+    /**
+     * Compare-and-delete: remove each row only if it still holds the value that was read.
+     * A row re-booked (new token) or created after the read survives for the next run.
+     *
+     * @param array $rows name => value, as returned by pending_rows().
+     */
+    private static function delete_pending( array $rows ) {
         global $wpdb;
-        if ( null === $names ) {
+        foreach ( $rows as $name => $value ) {
             $wpdb->query( $wpdb->prepare(
-                "DELETE FROM {$wpdb->options} WHERE option_name LIKE %s",
-                $wpdb->esc_like( self::PENDING_PREFIX ) . '%'
+                "DELETE FROM {$wpdb->options} WHERE option_name = %s AND option_value = %s",
+                $name,
+                $value
             ) );
-            return;
         }
-        if ( ! $names ) {
-            return;
-        }
-        $placeholders = implode( ',', array_fill( 0, count( $names ), '%s' ) );
-        $wpdb->query( $wpdb->prepare(
-            "DELETE FROM {$wpdb->options} WHERE option_name IN ($placeholders)",
-            $names
-        ) );
     }
 
     /**
@@ -400,11 +461,16 @@ final class SEC_Purger {
      * run: any admin request runs pending work that is overdue by a full window.
      */
     public static function maybe_run_overdue() {
+        // admin_init also fires for every admin-ajax.php hit, front-end ones included.
+        if ( wp_doing_ajax() ) {
+            return;
+        }
         $rows = self::pending_rows();
         if ( ! $rows ) {
             return;
         }
-        if ( time() - min( $rows ) >= max( 30, self::window() ) + 30 ) {
+        $oldest = min( array_map( 'intval', $rows ) ); // (int) "1791...:token" = the time
+        if ( time() - $oldest >= max( 30, self::window() ) + 30 ) {
             self::run_deferred();
         }
     }
@@ -491,6 +557,11 @@ final class SEC_Purger {
         }
         self::$purging = true;
 
+        // Snapshot what is pending now: this purge covers it. Anything booked while it runs
+        // is NOT covered and must survive (compare-and-delete below).
+        $covered_rows        = self::pending_rows();
+        self::$request_items = array();
+
         // 1. Wipe Elementor's per-post CSS files. They'll regen on next page hit.
         if ( class_exists( '\Elementor\Plugin' ) && ! empty( \Elementor\Plugin::$instance->files_manager ) ) {
             \Elementor\Plugin::$instance->files_manager->clear_cache();
@@ -528,9 +599,10 @@ final class SEC_Purger {
             sg_cachepress_purge_everything();
         }
 
-        // Everything still pending is covered by what just ran.
-        self::delete_pending();
-        wp_clear_scheduled_hook( self::HOOK_DEFERRED );
+        self::delete_pending( $covered_rows );
+        if ( ! self::pending_rows() ) {
+            wp_clear_scheduled_hook( self::HOOK_DEFERRED );
+        }
 
         self::stamp_last_purge( 'site', null );
         self::$purging = false;
