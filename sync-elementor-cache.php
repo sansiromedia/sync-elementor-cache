@@ -230,6 +230,15 @@ final class SEC_Purger {
     }
 
     /**
+     * Site-wide purge caused by saving ONE document (template, popup, font, Additional CSS,
+     * WPCode snippet). The purge is domain-wide, but the throttle is keyed to that document,
+     * so saving the footer is never held back because the header was saved a moment ago.
+     */
+    public static function purge_site_for( $source_post_id ) {
+        self::request_purge( self::SCOPE_SITE, null, (int) $source_post_id );
+    }
+
+    /**
      * Decide whether to purge now, later, or not at all:
      *
      *   1. sec_should_purge - the host site can veto. No-op by default.
@@ -241,7 +250,7 @@ final class SEC_Purger {
      *      expects to see their change. Repeat saves of the SAME item inside the window fold
      *      into one trailing purge.
      */
-    public static function request_purge( $scope, $post_id = null ) {
+    public static function request_purge( $scope, $post_id = null, $throttle_id = null ) {
 
         if ( ! apply_filters( 'sec_should_purge', true, $scope, $post_id ) ) {
             return;
@@ -252,7 +261,9 @@ final class SEC_Purger {
         }
 
         if ( ! self::is_interactive() ) {
-            self::defer( $scope, $post_id );
+            // Flushed at process end; no WP-Cron event, so a visitor-spawned cron run cannot
+            // start purging half-way through a long bulk job.
+            self::defer( $scope, $post_id, false );
             self::flush_on_shutdown();
             return;
         }
@@ -263,7 +274,7 @@ final class SEC_Purger {
             return;
         }
 
-        if ( self::is_throttled( $scope, $post_id ) ) {
+        if ( self::is_throttled( $scope, $post_id, $throttle_id ) ) {
             self::defer( $scope, $post_id );
             return;
         }
@@ -328,12 +339,16 @@ final class SEC_Purger {
      * back because page X was saved a moment ago. A transient: self-expiring, and on sites
      * with a persistent object cache it never touches the database.
      */
-    private static function is_throttled( $scope, $post_id = null ) {
+    private static function is_throttled( $scope, $post_id = null, $throttle_id = null ) {
         $window = self::window();
         if ( $window <= 0 ) {
             return false;
         }
-        $key = 'sec_thr_' . ( self::SCOPE_POST === $scope && $post_id ? (int) $post_id : 'site' );
+        if ( $throttle_id ) {
+            $key = 'sec_thr_' . (int) $throttle_id;
+        } else {
+            $key = 'sec_thr_' . ( self::SCOPE_POST === $scope && $post_id ? (int) $post_id : 'site' );
+        }
         if ( get_transient( $key ) ) {
             return true;
         }
@@ -349,7 +364,7 @@ final class SEC_Purger {
      * a run that read the old value will not delete it (see delete_pending()). Single atomic
      * statements on a unique key, so concurrent requests cannot lose each other's bookings.
      */
-    public static function defer( $scope, $post_id = null ) {
+    public static function defer( $scope, $post_id = null, $schedule = true ) {
         global $wpdb;
 
         $name  = self::PENDING_PREFIX . ( self::SCOPE_POST === $scope && $post_id ? (int) $post_id : 'site' );
@@ -363,7 +378,7 @@ final class SEC_Purger {
             $token
         ) );
 
-        if ( ! wp_next_scheduled( self::HOOK_DEFERRED ) ) {
+        if ( $schedule && ! wp_next_scheduled( self::HOOK_DEFERRED ) ) {
             wp_schedule_single_event( time() + max( 30, self::window() ), self::HOOK_DEFERRED );
         }
     }
@@ -559,19 +574,50 @@ final class SEC_Purger {
             }
             return;
         }
+        // Mirrors WP Rocket 3.23 rocket_clean_post() step for step - same skips, language, filters
+        // and before/after actions (term/date archives, preload, Sucuri, Cloudflare, host caches
+        // listen to those) - minus only its once-per-request static guard.
+        if ( function_exists( 'rocket_is_importing' ) && rocket_is_importing() ) {
+            return;
+        }
+        if ( defined( 'DOING_AUTOSAVE' ) ) {
+            return;
+        }
         $post = get_post( $pid );
-        if ( ! $post || in_array( $post->post_status, array( 'auto-draft', 'draft' ), true ) ) {
+        if ( ! is_object( $post ) ) {
+            return;
+        }
+        if ( 'auto-draft' === $post->post_status || 'draft' === $post->post_status || empty( $post->post_type ) || 'nav_menu_item' === $post->post_type || 'attachment' === $post->post_type ) {
             return;
         }
         $type = get_post_type_object( $post->post_type );
-        if ( ! $type || true !== $type->public ) {
+        if ( ! is_object( $type ) || true !== $type->public ) {
             return;
         }
-        $urls = apply_filters( 'rocket_post_purge_urls', rocket_get_purge_urls( $pid, $post ), $post );
-        rocket_clean_files( $urls );
-        if ( function_exists( 'rocket_clean_home' ) ) {
-            rocket_clean_home();
+
+        $lang = '';
+        $i18n = function_exists( 'rocket_has_i18n' ) ? rocket_has_i18n() : false;
+        if ( 'wpml' === $i18n && isset( $GLOBALS['sitepress'] ) && function_exists( 'rocket_is_plugin_active' ) && ! rocket_is_plugin_active( 'woocommerce-multilingual/wpml-woocommerce.php' ) ) {
+            $lang = $GLOBALS['sitepress']->get_language_for_element( $pid, 'post_' . get_post_type( $pid ) );
+        } elseif ( 'polylang' === $i18n && function_exists( 'pll_get_post_language' ) ) {
+            $lang = pll_get_post_language( $pid );
         }
+
+        $urls = rocket_get_purge_urls( $pid, $post );
+        do_action( 'before_rocket_clean_post', $post, $urls, $lang ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals
+        $urls = apply_filters( 'rocket_post_purge_urls', $urls, $post ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals
+        rocket_clean_files( $urls );
+
+        $home_after = apply_filters( 'rocket_clean_home_after_clean_post', true, $pid ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals
+        if ( $home_after && function_exists( 'rocket_clean_home' ) ) {
+            rocket_clean_home( $lang );
+        }
+        if ( function_exists( 'rocket_clean_home_feeds' ) && false !== has_filter( 'rocket_cache_reject_uri', 'wp_rocket_cache_feed' ) ) {
+            rocket_clean_home_feeds();
+        }
+
+        $urls = (array) apply_filters( 'after_rocket_clean_post_urls', $urls, $post ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals
+        do_action( 'after_rocket_clean_post', $post, $urls, $lang ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals
     }
 
     /** SCOPE_POST for one or more posts: per-post work in a loop, one SG soft purge total. */
@@ -906,12 +952,43 @@ final class SEC_Purger {
         if ( ! $post_id ) {
             return;
         }
+        // Elementor autosaves of a DRAFT are written into the draft itself, so is_autosave() and
+        // wp_is_post_autosave() are false; only the request says it is an autosave. Visitors
+        // cannot see an autosave either way, so do not purge (every 60s while editing).
+        if ( self::is_elementor_autosave_request() ) {
+            return;
+        }
         if ( self::is_site_wide_post( $post_id ) ) {
             self::refresh_document_css( $post_id );
-            self::purge_all( null );          // domain-wide: a template appears on arbitrary pages
+            self::purge_site_for( $post_id ); // domain-wide: a template appears on arbitrary pages
         } else {
             self::purge_all( $post_id );
         }
+    }
+
+    /**
+     * True when this is an Elementor editor ajax request whose every save_builder action is an
+     * autosave (status "autosave"). A request that also does a real save returns false.
+     */
+    public static function is_elementor_autosave_request() {
+        if ( ! wp_doing_ajax() || ! isset( $_REQUEST['action'], $_REQUEST['actions'] ) || 'elementor_ajax' !== $_REQUEST['action'] ) {
+            return false;
+        }
+        $actions = json_decode( wp_unslash( (string) $_REQUEST['actions'] ), true );
+        if ( ! is_array( $actions ) ) {
+            return false;
+        }
+        $saves = 0;
+        foreach ( $actions as $a ) {
+            if ( ! is_array( $a ) || 'save_builder' !== ( $a['action'] ?? '' ) ) {
+                continue;
+            }
+            $saves++;
+            if ( 'autosave' !== ( $a['data']['status'] ?? '' ) ) {
+                return false;
+            }
+        }
+        return $saves > 0;
     }
 
     private static function stamp_last_purge( $scope, $post_id ) {
@@ -1002,7 +1079,7 @@ add_action( 'save_post_elementor_font', function ( $post_id ) {
     if ( $kit ) {
         SEC_Purger::refresh_document_css( $kit );
     }
-    SEC_Purger::purge_all( null );
+    SEC_Purger::purge_site_for( $post_id );
 }, 5 );
 
 // Elementor Kit (global colors/typography) and bulk regen.
@@ -1010,14 +1087,14 @@ add_action( 'update_option_elementor_active_kit',    array( 'SEC_Purger', 'purge
 add_action( 'elementor/core/files/after_regenerate', array( 'SEC_Purger', 'purge_site' ), 5 );
 
 // WordPress "Additional CSS" edits.
-add_action( 'save_post_custom_css', function () { SEC_Purger::purge_all( null ); }, 5 );
+add_action( 'save_post_custom_css', function ( $post_id ) { SEC_Purger::purge_site_for( $post_id ); }, 5 );
 
 // WPCode snippet saves (changes runtime PHP/JS output cached in HTML).
 add_action( 'save_post_wpcode', function ( $post_id ) {
     if ( wp_is_post_revision( $post_id ) || wp_is_post_autosave( $post_id ) ) {
         return;
     }
-    SEC_Purger::purge_all( null );
+    SEC_Purger::purge_site_for( $post_id );
 }, 5 );
 
 // Manual admin purge: ?sec_purge_all=1 on any front-end URL while logged in

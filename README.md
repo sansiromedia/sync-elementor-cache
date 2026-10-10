@@ -30,12 +30,34 @@ Library templates and JetEngine listings always route to site-wide (they're embe
 
 ## What it purges (when present)
 
-- **Elementor:** `\Elementor\Plugin::$instance->files_manager->clear_cache()` — regenerates all per-post CSS files
-- **WP Rocket:** `rocket_clean_post`, `rocket_clean_domain`, `rocket_clean_minify('css')`, `rocket_clean_cache_busting`, `rocket_clean_used_css`
-- **SiteGround Optimizer:** `sg_cachepress_purge_cache()` (per-post / soft) + `sg_cachepress_purge_everything()` (site-wide / nuclear)
-- **WordPress:** `wp_cache_flush()`
+Since v4.7.0 a purge is scoped to what changed:
+
+| Trigger | Elementor | WP Rocket | SiteGround | Object cache |
+|---|---|---|---|---|
+| Page/post save | (Elementor rewrites that page's CSS itself) | that post's URLs + home (mirrors `rocket_clean_post`) | domain-wide soft purge | that post only (`clean_post_cache`) |
+| Template / popup / font / Additional CSS / WPCode save | saved document's CSS refreshed | `rocket_clean_domain`, `rocket_clean_minify('css')`, `rocket_clean_cache_busting` | domain-wide soft purge | untouched |
+| Plugin/theme update, kit switch, Regenerate, manual purge (`purge_site`) | `clear_cache()` + kit/header/footer CSS regenerated | as above | soft + `sg_cachepress_purge_everything()` (nuclear) | `wp_cache_flush()` |
+
+**When it runs:**
+- **Browser saves** purge once at the end of the request, after Elementor's last write.
+- **A repeat save of the same document within 15s** (`sec_purge_window`) folds into one trailing purge.
+- **WP-CLI and cron** purge once when the process ends.
+- **Pending work** is stored as one `sec_pending_*` row per item in `wp_options`, read with direct SQL (never the object cache).
+- **Trailing purges** run from WP-Cron. If WP-Cron isn't running, the next wp-admin page load runs any that are overdue.
+
+**Filters:**
+- `sec_should_purge` vetoes a purge.
+- `sec_purge_window` sets the throttle in seconds (`0` restores the <= 4.6.x immediate behaviour).
+- `sec_is_interactive` overrides whether a request counts as interactive.
+
+**Note for WP Rocket older than 3.10.9:** page saves no longer clear Rocket's minified CSS. Rocket 3.10.9+ excludes `uploads/elementor/css/` from minification, so this only matters on very old Rocket with Minify CSS on.
 
 The split between SG soft and SG nuclear matters: SG's full-page cache can hold cached error responses (e.g. a 403 from a transient WAF rate-limit) that the soft URL purge can't reach. Site-wide events use the nuclear purge so error responses don't get stuck.
+
+## Tests
+
+`tests/integration-test.php` runs inside a real **staging** WordPress (it purges caches):
+`wp eval-file wp-content/plugins/sync-elementor-cache/tests/integration-test.php`. Not shipped in the release zip.
 
 ## What it does NOT do
 

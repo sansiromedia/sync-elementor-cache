@@ -55,6 +55,15 @@ function sec_reset( $extra_ids = array() ) {
     foreach ( array_merge( array( 1, 2, 3, 900001, 900002, 900003, 'site' ), (array) $extra_ids ) as $id ) {
         delete_transient( 'sec_thr_' . $id );
     }
+    // SG's memcached drop-in keeps an in-process copy when memcached's delete "fails" because the
+    // key already expired there (15s throttle, long test run). Drop those copies too.
+    if ( isset( $GLOBALS['wp_object_cache']->cache ) && is_array( $GLOBALS['wp_object_cache']->cache ) ) {
+        foreach ( array_keys( $GLOBALS['wp_object_cache']->cache ) as $k ) {
+            if ( false !== strpos( (string) $k, 'sec_thr_' ) ) {
+                unset( $GLOBALS['wp_object_cache']->cache[ $k ] );
+            }
+        }
+    }
     wp_clear_scheduled_hook( SEC_Purger::HOOK_DEFERRED );
     $ref = new ReflectionClass( 'SEC_Purger' );
     foreach ( array( 'request_flush_ran' => false, 'origin_hook' => '' ) as $prop => $val ) {
@@ -123,8 +132,12 @@ global $wpdb;
 $sec_ref  = new ReflectionClass( 'SEC_Purger' );
 $sec_priv = function ( $name ) use ( $sec_ref ) { $m = $sec_ref->getMethod( $name ); $m->setAccessible( true ); return $m; };
 $sg_on    = function_exists( 'sg_cachepress_purge_cache' ) && get_option( 'siteground_optimizer_enable_cache' );
-$some_post = (int) $wpdb->get_var( "SELECT ID FROM {$wpdb->posts} WHERE post_type='page' AND post_status='publish' ORDER BY ID LIMIT 1" );
-$template  = (int) $wpdb->get_var( "SELECT ID FROM {$wpdb->posts} WHERE post_type='elementor_library' AND post_status='publish' ORDER BY ID LIMIT 1" );
+// Not the front page / posts page: Rocket purges those via rocket_clean_home, not by URL.
+$not_home  = array_filter( array( (int) get_option( 'page_on_front' ), (int) get_option( 'page_for_posts' ) ) );
+$not_home  = $not_home ? ' AND ID NOT IN (' . implode( ',', $not_home ) . ')' : '';
+$some_post = (int) $wpdb->get_var( "SELECT ID FROM {$wpdb->posts} WHERE post_type='page' AND post_status='publish'{$not_home} ORDER BY ID LIMIT 1" );
+$templates = array_map( 'intval', $wpdb->get_col( "SELECT ID FROM {$wpdb->posts} WHERE post_type='elementor_library' AND post_status='publish' ORDER BY ID LIMIT 2" ) );
+$template  = $templates[0] ?? 0;
 $interactive_on  = function () { add_filter( 'sec_is_interactive', '__return_true' ); };
 $interactive_off = function () { remove_filter( 'sec_is_interactive', '__return_true' ); };
 
@@ -357,13 +370,18 @@ if ( ! function_exists( 'rocket_clean_post' ) ) {
     $interactive_on();
     SEC_Purger::purge_all( $some_post );
     $files = array();
+    $after = array();
     $cb    = function ( $urls ) use ( &$files ) { $files = array_merge( $files, (array) $urls ); };
+    $cb2   = function ( $post, $urls, $lang ) use ( &$after ) { $after[] = (int) $post->ID; };
     add_action( 'before_rocket_clean_files', $cb );
+    add_action( 'after_rocket_clean_post', $cb2, 10, 3 );
     if ( method_exists( 'SEC_Purger', 'run_request_purges' ) ) { SEC_Purger::run_request_purges(); }
     remove_action( 'before_rocket_clean_files', $cb );
+    remove_action( 'after_rocket_clean_post', $cb2, 10 );
     $interactive_off();
     $permalink = get_permalink( $some_post );
     sec_t( 'shutdown purge clears the page in Rocket despite its once-per-request guard', in_array( $permalink, $files, true ), 'rocket files purged: ' . count( $files ) );
+    sec_t( 'shutdown purge fires after_rocket_clean_post (archives, preload, CDN listeners)', in_array( $some_post, $after, true ), 'after_rocket_clean_post for: ' . json_encode( $after ) );
 }
 
 // 17. A held lock never leaves pending work without a scheduled event.
@@ -402,6 +420,56 @@ $interactive_off();
 wp_cache_delete( 'sec_last_purge', 'options' );
 $l = get_option( 'sec_last_purge' );
 sec_t( 'last purge records the originating hook', 'sec_test_origin' === ( $l['hook'] ?? '' ), 'hook=' . ( $l['hook'] ?? '?' ) );
+
+
+// 20. Site-wide saves of DIFFERENT documents (header, then footer) are not throttled together.
+if ( count( $templates ) < 2 ) {
+    sec_skip( 'header then footer both purge', 'needs 2 published templates' );
+} else {
+    sec_reset( $templates );
+    $interactive_on();
+    $new_request = function () use ( $sec_ref ) {
+        foreach ( array( 'request_items' => array(), 'request_flush_ran' => false ) as $prop => $val ) {
+            $p = $sec_ref->getProperty( $prop ); $p->setAccessible( true ); $p->setValue( null, $val );
+        }
+    };
+    SEC_Purger::purge_for_elementor_post( $templates[0] );
+    $first = $sec_ref->getProperty( 'request_items' ); $first->setAccessible( true ); $c1 = $first->getValue();
+    $new_request();
+    SEC_Purger::purge_for_elementor_post( $templates[1] );
+    $c2 = $first->getValue();
+    $interactive_off();
+    sec_t( 'header then footer (separate requests, within the window): both purge, neither deferred',
+        isset( $c1['site'] ) && isset( $c2['site'] ) && array() === sec_pending(),
+        'req1=' . json_encode( array_keys( $c1 ) ) . ' req2=' . json_encode( array_keys( $c2 ) ) . ' pending=' . json_encode( sec_pending() ) );
+}
+
+// 21. An Elementor autosave request of a DRAFT (written into the draft itself) does not purge;
+//     a real save request does.
+sec_reset( array( $some_post ) );
+$interactive_on();
+add_filter( 'wp_doing_ajax', '__return_true' );
+$saved_request = $_REQUEST;
+$items_prop    = $sec_ref->getProperty( 'request_items' ); $items_prop->setAccessible( true );
+$_REQUEST['action']  = 'elementor_ajax';
+$_REQUEST['actions'] = wp_slash( wp_json_encode( array( 'save_builder_' . $some_post => array( 'action' => 'save_builder', 'data' => array( 'status' => 'autosave' ) ) ) ) );
+SEC_Purger::purge_for_elementor_post( $some_post );
+$auto = $items_prop->getValue();
+sec_reset( array( $some_post ) );
+$_REQUEST['actions'] = wp_slash( wp_json_encode( array( 'save_builder_' . $some_post => array( 'action' => 'save_builder', 'data' => array( 'status' => 'publish' ) ) ) ) );
+SEC_Purger::purge_for_elementor_post( $some_post );
+$real = $items_prop->getValue();
+$_REQUEST = $saved_request;
+remove_filter( 'wp_doing_ajax', '__return_true' );
+$interactive_off();
+sec_t( 'draft autosave request does not purge; a real save does', array() === $auto && isset( $real[ $some_post ] ) && array() === sec_pending(),
+    'autosave collected=' . json_encode( array_keys( $auto ) ) . ' real collected=' . json_encode( array_keys( $real ) ) );
+
+// 22. WP-CLI / cron purges book no WP-Cron event (they flush at process end).
+sec_reset( array( $some_post ) );
+SEC_Purger::purge_all( $some_post );
+$scheduled = (bool) wp_next_scheduled( SEC_Purger::HOOK_DEFERRED );
+sec_t( 'CLI purge books no WP-Cron event', ! $scheduled && array( $some_post ) === sec_pending(), 'scheduled=' . var_export( $scheduled, true ) );
 
 sec_reset( array( $some_post, $template ) );
 echo "\n" . $GLOBALS['sec_results']['pass'] . ' passed, ' . $GLOBALS['sec_results']['fail'] . ' failed, ' . $GLOBALS['sec_results']['skip'] . " skipped\n";
