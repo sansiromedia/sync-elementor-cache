@@ -23,7 +23,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 define( 'SEC_PLUGIN_FILE',    __FILE__ );
 define( 'SEC_PLUGIN_DIR',     plugin_dir_path( __FILE__ ) );
-define( 'SEC_PLUGIN_VERSION', '4.6.0' );
+define( 'SEC_PLUGIN_VERSION', '4.7.0' );
 define( 'SEC_PLUGIN_SLUG',    'sync-elementor-cache' );
 
 // ---------------------------------------------------------------------------
@@ -177,6 +177,30 @@ final class SEC_Purger {
     const HOOK_DEFERRED = 'sec_run_deferred_purge';
 
     /**
+     * Pending-purge rows live in wp_options as one row per item, named
+     * sec_pending_{post id} or sec_pending_site, value = time() it was booked.
+     *
+     * One row per item (not one shared array) so concurrent requests can never overwrite each
+     * other's entries, and run_deferred() only deletes the rows it actually read. They are read
+     * and written with direct SQL, never get_option(): a persistent object cache (SG memcached)
+     * can serve a stale option long after the DB changed (Provenir, 2026-10-10).
+     */
+    const PENDING_PREFIX = 'sec_pending_';
+
+    /** Past this many distinct deferred posts, one site-wide purge is cheaper. */
+    const DEFER_COLLAPSE_AT = 20;
+
+    /** Whether a shutdown flush is already registered for this request. */
+    private static $shutdown_registered = false;
+
+    /**
+     * Items already purged in this request. One Elementor template save fires three hooks
+     * (save_post_elementor_library, editor/after_save, document/after_save); the first purges
+     * and the other two are no-ops instead of each booking another trailing purge.
+     */
+    private static $done_this_request = array();
+
+    /**
      * Public entry point. Signature-compatible with <= 4.6.x: an id means "one page
      * changed", null means "something global changed".
      *
@@ -189,14 +213,15 @@ final class SEC_Purger {
     }
 
     /**
-     * Decide whether to purge now, later, or not at all. Three gates, cheapest first:
+     * Decide whether to purge now, later, or not at all:
      *
      *   1. sec_should_purge - the host site can veto. No-op by default.
-     *   2. non-interactive context (WP-CLI, cron) - always coalesce. Nobody is watching
-     *      a screen, and these are exactly where bulk writers live.
-     *   3. rate window - the FIRST save purges immediately, because an editor expects to
-     *      see their change. Saves inside the window fold into one trailing purge.
-     *      Leading-edge debounce: 20 saves in a minute cost 2 purges, not 20.
+     *   2. inside purge_site() - nothing to do, its own site-wide execute() covers it.
+     *   3. non-interactive context (WP-CLI, cron) - collect, then purge once when the
+     *      process ends. Nobody is watching a screen, and bulk writers live here.
+     *   4. rate window - the first save of each page (or of site-wide CSS) purges
+     *      immediately, because an editor expects to see their change. Repeat saves of the
+     *      SAME item inside the window fold into one trailing purge.
      */
     public static function request_purge( $scope, $post_id = null ) {
 
@@ -204,115 +229,198 @@ final class SEC_Purger {
             return;
         }
 
-        // Inside purge_site(): the caller already decided this is nuclear.
         if ( self::$purging ) {
-            self::execute( $post_id, $scope, true );
             return;
         }
 
-        if ( ! self::is_interactive() || self::is_throttled( $scope ) ) {
+        if ( ! self::is_interactive() ) {
+            self::defer( $scope, $post_id );
+            self::flush_on_shutdown();
+            return;
+        }
+
+        // Exact repeat of an item already purged in this request (one save, several hooks).
+        $item = self::SCOPE_POST === $scope && $post_id ? (int) $post_id : 'site';
+        if ( isset( self::$done_this_request[ $item ] ) ) {
+            return;
+        }
+
+        if ( self::is_throttled( $scope, $post_id ) ) {
             self::defer( $scope, $post_id );
             return;
         }
 
+        self::$done_this_request[ $item ] = true;
         self::execute( $post_id, $scope, false );
     }
 
-    /** WP-CLI and cron are bulk contexts by nature - never purge synchronously there. */
+    /** WP-CLI and cron are bulk contexts by nature - never purge per write there. */
     private static function is_interactive() {
+        $interactive = true;
         if ( defined( 'WP_CLI' ) && WP_CLI ) {
-            return false;
+            $interactive = false;
+        } elseif ( function_exists( 'wp_doing_cron' ) && wp_doing_cron() ) {
+            $interactive = false;
         }
-        if ( function_exists( 'wp_doing_cron' ) && wp_doing_cron() ) {
-            return false;
-        }
-        return true;
+        return (bool) apply_filters( 'sec_is_interactive', $interactive );
     }
 
-    /** Debounce window, seconds. Filter to 0 to restore <= 4.6.x immediate behaviour. */
+    /**
+     * Debounce window, seconds. Short on purpose: it exists to absorb bursts (a save
+     * clicked twice, a plugin re-saving in a loop), not to delay an editor's second
+     * deliberate save. Bulk writers (WP-CLI, cron) are coalesced separately. Filter to 0
+     * to restore <= 4.6.x immediate behaviour.
+     */
     private static function window() {
-        return max( 0, (int) apply_filters( 'sec_purge_window', 60 ) );
+        return max( 0, (int) apply_filters( 'sec_purge_window', 15 ) );
     }
 
-    private static function is_throttled( $scope ) {
+    /**
+     * Leading-edge throttle, keyed per post (or 'site'), so saving page Y is never held
+     * back because page X was saved a moment ago. A transient: self-expiring, and on sites
+     * with a persistent object cache it never touches the database.
+     */
+    private static function is_throttled( $scope, $post_id = null ) {
         $window = self::window();
         if ( $window <= 0 ) {
             return false;
         }
-        $key  = 'sec_purge_last_' . $scope;
-        $last = (int) get_option( $key, 0 );
-        $now  = time();
-        if ( $last && ( $now - $last ) < $window ) {
+        $key = 'sec_thr_' . ( self::SCOPE_POST === $scope && $post_id ? (int) $post_id : 'site' );
+        if ( get_transient( $key ) ) {
             return true;
         }
-        update_option( $key, $now, false );
+        set_transient( $key, 1, $window );
         return false;
     }
 
     /**
      * Fold this request into the pending set and book a trailing purge.
      *
-     * Post ids dedupe by array key, so a writer touching one post 500 times costs one
-     * entry. Past 200 distinct posts a single domain purge is cheaper than 200 targeted
-     * ones, so the set collapses to site scope.
+     * INSERT IGNORE on a unique option_name is atomic, so a post booked 500 times is one
+     * row and two requests booking different posts cannot lose either.
      */
     public static function defer( $scope, $post_id = null ) {
+        global $wpdb;
 
-        $pending = get_option( 'sec_pending_purge' );
-        if ( ! is_array( $pending ) ) {
-            $pending = array( 'site' => false, 'posts' => array() );
-        }
+        $name = self::PENDING_PREFIX . ( self::SCOPE_POST === $scope && $post_id ? (int) $post_id : 'site' );
 
-        if ( self::SCOPE_SITE === $scope ) {
-            $pending['site']  = true;
-            $pending['posts'] = array();
-        } elseif ( $post_id ) {
-            $pending['posts'][ (int) $post_id ] = 1;
-            if ( count( $pending['posts'] ) > 200 ) {
-                $pending['site']  = true;
-                $pending['posts'] = array();
-            }
-        }
-
-        update_option( 'sec_pending_purge', $pending, false );
+        $wpdb->query( $wpdb->prepare(
+            "INSERT IGNORE INTO {$wpdb->options} (option_name, option_value, autoload) VALUES (%s, %s, 'no')",
+            $name,
+            (string) time()
+        ) );
 
         if ( ! wp_next_scheduled( self::HOOK_DEFERRED ) ) {
             wp_schedule_single_event( time() + max( 30, self::window() ), self::HOOK_DEFERRED );
         }
     }
 
-    /** Run the coalesced purge booked by defer(). */
+    /** Pending rows straight from the DB: name => booked-at timestamp. */
+    private static function pending_rows() {
+        global $wpdb;
+        $like = $wpdb->esc_like( self::PENDING_PREFIX ) . '%';
+        $rows = $wpdb->get_results( $wpdb->prepare(
+            "SELECT option_name, option_value FROM {$wpdb->options} WHERE option_name LIKE %s",
+            $like
+        ) );
+        $out = array();
+        foreach ( (array) $rows as $row ) {
+            $out[ $row->option_name ] = (int) $row->option_value;
+        }
+        return $out;
+    }
+
+    /**
+     * Run the coalesced purge booked by defer(). Claims exactly the rows it read, so a
+     * defer() landing mid-run survives for the next run instead of being deleted unseen.
+     */
     public static function run_deferred() {
+        global $wpdb;
 
-        $pending = get_option( 'sec_pending_purge' );
-        delete_option( 'sec_pending_purge' );
-
-        if ( ! is_array( $pending ) ) {
+        $rows = self::pending_rows();
+        if ( ! $rows ) {
             return;
         }
 
-        if ( ! empty( $pending['site'] ) ) {
+        $names    = array_keys( $rows );
+        $site_key = self::PENDING_PREFIX . 'site';
+        $post_ids = array();
+        foreach ( $names as $name ) {
+            if ( $name !== $site_key ) {
+                $post_ids[] = (int) substr( $name, strlen( self::PENDING_PREFIX ) );
+            }
+        }
+        $post_ids = array_filter( $post_ids );
+
+        if ( isset( $rows[ $site_key ] ) || count( $post_ids ) > self::DEFER_COLLAPSE_AT ) {
             self::execute( null, self::SCOPE_SITE, false );
-            return;
+        } else {
+            self::execute_posts( $post_ids );
         }
 
-        foreach ( array_keys( (array) $pending['posts'] ) as $pid ) {
-            self::execute( (int) $pid, self::SCOPE_POST, false );
+        // Delete only after the purge ran, so a fatal mid-purge leaves the work pending
+        // (at-least-once: a repeated purge is harmless, a lost one is not).
+        self::delete_pending( $names );
+    }
+
+    /** Delete pending rows by name, or all of them when $names is null. */
+    private static function delete_pending( $names = null ) {
+        global $wpdb;
+        if ( null === $names ) {
+            $wpdb->query( $wpdb->prepare(
+                "DELETE FROM {$wpdb->options} WHERE option_name LIKE %s",
+                $wpdb->esc_like( self::PENDING_PREFIX ) . '%'
+            ) );
+            return;
+        }
+        if ( ! $names ) {
+            return;
+        }
+        $placeholders = implode( ',', array_fill( 0, count( $names ), '%s' ) );
+        $wpdb->query( $wpdb->prepare(
+            "DELETE FROM {$wpdb->options} WHERE option_name IN ($placeholders)",
+            $names
+        ) );
+    }
+
+    /**
+     * WP-CLI / cron: purge once when this process ends, not once per write, and without
+     * depending on WP-Cron ever running (DISABLE_WP_CRON with no system cron is common).
+     */
+    private static function flush_on_shutdown() {
+        if ( self::$shutdown_registered ) {
+            return;
+        }
+        self::$shutdown_registered = true;
+        add_action( 'shutdown', array( __CLASS__, 'run_deferred' ), 0 );
+    }
+
+    /**
+     * Fallback for the trailing purge of throttled interactive saves when WP-Cron does not
+     * run: any admin request runs pending work that is overdue by a full window.
+     */
+    public static function maybe_run_overdue() {
+        $rows = self::pending_rows();
+        if ( ! $rows ) {
+            return;
+        }
+        if ( time() - min( $rows ) >= max( 30, self::window() ) + 30 ) {
+            self::run_deferred();
         }
     }
 
     /**
      * Do the actual cache clearing.
      *
-     * SCOPE_POST touches ONLY the changed page. v4.6.x called the three site-wide Rocket
-     * CSS cleaners (minify / cache-busting / used-CSS) plus wp_cache_flush() on EVERY
-     * save, so one editor saving one page wiped the entire object cache and every
-     * minified bundle. On a site with a persistent object cache (memcached/Redis) that
-     * flush is self-inflicted load - every option, term and meta lookup goes back to
-     * MySQL at once, in a thundering herd.
+     * SCOPE_POST: per-page Rocket purge and post-cache invalidation only. v4.6.x also called
+     * the three site-wide Rocket CSS cleaners (minify / cache-busting / used-CSS) plus
+     * wp_cache_flush() on EVERY save, so one editor saving one page wiped the entire object
+     * cache and every minified bundle - on memcached/Redis sites a thundering herd back to
+     * MySQL. SG's dynamic-cache soft purge stays domain-wide as in 4.6.x: it is page cache
+     * only, and on SG-only sites it is the only thing that refreshes the home page, archives
+     * and listing grids that show the saved post.
      *
-     * Shared bundles only need clearing when shared CSS actually changed: SCOPE_SITE.
-     * A full object-cache flush is reserved for purge_site().
+     * SCOPE_SITE: shared bundles too. A full object-cache flush is reserved for purge_site().
      *
      * @param int|null $post_id            Post, for SCOPE_POST.
      * @param string   $scope              SCOPE_POST | SCOPE_SITE.
@@ -321,43 +429,54 @@ final class SEC_Purger {
     public static function execute( $post_id, $scope, $flush_object_cache = false ) {
 
         if ( self::SCOPE_POST === $scope && $post_id ) {
+            self::execute_posts( array( (int) $post_id ) );
+            return;
+        }
 
-            if ( function_exists( 'rocket_clean_post' ) ) {
-                rocket_clean_post( $post_id );
-            }
-
-            // Targeted object-cache invalidation. Also makes Rocket's own
-            // clean_post_cache subscribers drop this post's used-CSS.
-            clean_post_cache( $post_id );
-
-            if ( function_exists( 'sg_cachepress_purge_cache' ) ) {
-                $url = get_permalink( $post_id );
-                sg_cachepress_purge_cache( $url ? $url : false );
-            }
-        } else {
-
-            if ( function_exists( 'rocket_clean_domain' ) ) {
-                rocket_clean_domain();
-            }
-            if ( function_exists( 'rocket_clean_minify' ) ) {
-                rocket_clean_minify( 'css' );
-            }
-            if ( function_exists( 'rocket_clean_cache_busting' ) ) {
-                rocket_clean_cache_busting();
-            }
-            if ( function_exists( 'rocket_clean_used_css' ) ) {
-                rocket_clean_used_css();
-            }
-            if ( function_exists( 'sg_cachepress_purge_cache' ) ) {
-                sg_cachepress_purge_cache();
-            }
+        if ( function_exists( 'rocket_clean_domain' ) ) {
+            rocket_clean_domain();
+        }
+        if ( function_exists( 'rocket_clean_minify' ) ) {
+            rocket_clean_minify( 'css' );
+        }
+        if ( function_exists( 'rocket_clean_cache_busting' ) ) {
+            rocket_clean_cache_busting();
+        }
+        if ( function_exists( 'rocket_clean_used_css' ) ) {
+            rocket_clean_used_css();
+        }
+        if ( function_exists( 'sg_cachepress_purge_cache' ) ) {
+            sg_cachepress_purge_cache();
         }
 
         if ( $flush_object_cache ) {
             wp_cache_flush();
         }
 
-        self::stamp_last_purge( $scope, $post_id );
+        self::stamp_last_purge( $scope, null );
+    }
+
+    /** SCOPE_POST for one or more posts: per-post work in a loop, one SG soft purge total. */
+    public static function execute_posts( array $post_ids ) {
+        $post_ids = array_values( array_unique( array_filter( array_map( 'intval', $post_ids ) ) ) );
+        if ( ! $post_ids ) {
+            return;
+        }
+
+        foreach ( $post_ids as $pid ) {
+            if ( function_exists( 'rocket_clean_post' ) ) {
+                rocket_clean_post( $pid );
+            }
+            // Targeted object-cache invalidation. Also makes Rocket's own
+            // clean_post_cache subscribers drop this post's used-CSS.
+            clean_post_cache( $pid );
+        }
+
+        if ( function_exists( 'sg_cachepress_purge_cache' ) ) {
+            sg_cachepress_purge_cache();
+        }
+
+        self::stamp_last_purge( self::SCOPE_POST, count( $post_ids ) === 1 ? $post_ids[0] : null );
     }
 
     /**
@@ -408,6 +527,10 @@ final class SEC_Purger {
         if ( function_exists( 'sg_cachepress_purge_everything' ) ) {
             sg_cachepress_purge_everything();
         }
+
+        // Everything still pending is covered by what just ran.
+        self::delete_pending();
+        wp_clear_scheduled_hook( self::HOOK_DEFERRED );
 
         self::stamp_last_purge( 'site', null );
         self::$purging = false;
@@ -695,6 +818,19 @@ final class SEC_Purger {
 // Coalesced trailing purge booked by SEC_Purger::defer().
 add_action( SEC_Purger::HOOK_DEFERRED, array( 'SEC_Purger', 'run_deferred' ) );
 
+// Trailing purge fallback when WP-Cron is not running.
+add_action( 'admin_init', array( 'SEC_Purger', 'maybe_run_overdue' ) );
+
+// Deactivation: drop the scheduled event and any pending rows (they are useless without us).
+register_deactivation_hook( __FILE__, function () {
+    global $wpdb;
+    wp_clear_scheduled_hook( SEC_Purger::HOOK_DEFERRED );
+    $wpdb->query( $wpdb->prepare(
+        "DELETE FROM {$wpdb->options} WHERE option_name LIKE %s",
+        $wpdb->esc_like( SEC_Purger::PENDING_PREFIX ) . '%'
+    ) );
+} );
+
 // Elementor's explicit "clear CSS" action.
 add_action( 'elementor/core/files/clear_cache', array( 'SEC_Purger', 'purge_site' ), 5 );
 
@@ -710,10 +846,18 @@ add_action( 'elementor/document/after_save', function ( $document ) {
     if ( ! $document || ! method_exists( $document, 'get_main_id' ) ) {
         return;
     }
+    // Autosaves change nothing visitors see, and must not use up the purge window
+    // that the real Update click needs.
+    if ( method_exists( $document, 'is_autosave' ) && $document->is_autosave() ) {
+        return;
+    }
     SEC_Purger::purge_for_elementor_post( $document->get_main_id() );
 }, 5 );
 
 add_action( 'elementor/editor/after_save', function ( $post_id ) {
+    if ( wp_is_post_autosave( $post_id ) || wp_is_post_revision( $post_id ) ) {
+        return;
+    }
     SEC_Purger::purge_for_elementor_post( (int) $post_id );
 }, 5 );
 
