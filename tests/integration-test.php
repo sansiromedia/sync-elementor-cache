@@ -503,7 +503,12 @@ if ( ! function_exists( 'rocket_clean_post' ) ) {
     add_action( 'after_rocket_clean_post', $cb3 );
     if ( $other ) { SEC_Purger::execute_posts( array( $other ) ); }
     remove_action( 'after_rocket_clean_post', $cb3 );
-    sec_t( 'Rocket per-post purge (and its CDN/host listeners) runs once, not twice', ! $other || 1 === $fires, "post $other: $fires time(s)" );
+    if ( ! $other ) {
+        sec_skip( 'Rocket per-post purge runs once', 'needs a second published page' );
+    } else {
+        $still = false !== has_action( 'clean_post_cache', 'rocket_clean_post' );
+        sec_t( 'Rocket per-post purge (and its CDN/host listeners) runs once, not twice; hook restored', 1 === $fires && $still, "post $other: $fires time(s), hook restored=" . var_export( $still, true ) );
+    }
 }
 
 sec_reset( array( $some_post, $template ) );

@@ -597,8 +597,9 @@ final class SEC_Purger {
         if ( function_exists( 'rocket_is_importing' ) && rocket_is_importing() ) {
             return;
         }
-        // As Rocket: a WordPress heartbeat/post autosave request never purges. (Elementor's
-        // autosaves don't define DOING_AUTOSAVE; they are handled in purge_for_elementor_post().)
+        // As Rocket: an autosave request never purges. Elementor's Document::save() defines
+        // DOING_AUTOSAVE for its autosaves too; those are also filtered earlier, in the hooks and
+        // in purge_for_elementor_post().
         if ( defined( 'DOING_AUTOSAVE' ) ) {
             return;
         }
@@ -655,9 +656,12 @@ final class SEC_Purger {
             if ( false !== $rocket_hooked ) {
                 remove_action( 'clean_post_cache', 'rocket_clean_post', $rocket_hooked );
             }
-            clean_post_cache( $pid );
-            if ( false !== $rocket_hooked ) {
-                add_action( 'clean_post_cache', 'rocket_clean_post', $rocket_hooked );
+            try {
+                clean_post_cache( $pid );
+            } finally {
+                if ( false !== $rocket_hooked ) {
+                    add_action( 'clean_post_cache', 'rocket_clean_post', $rocket_hooked );
+                }
             }
         }
 
